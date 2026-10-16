@@ -1,0 +1,29 @@
+# Insert the Claude Subscription route into the profile.
+#
+# The route is named `claude-sub` (NOT `anthropic`) on purpose: it is a
+# separate LlmAdapter registration so this plugin owns its own request
+# headers. Reusing the `anthropic` route would hand the request to
+# dsh-llm-pi-ai, whose requestHeaders() overwrites the User-Agent with the
+# harness attribution header and destroys the subscription identity.
+#
+# Configuration notes:
+#   proxy.url          - the only transport this route will use. Requests are
+#                        refused when it is unset or unreachable. 9077 is the
+#                        Claude-specific proxy: the general proxy (9076) resets
+#                        the connection for every api.anthropic.com / claude.ai
+#                        host, so it cannot carry this route.
+#   proxy.egressAllow  - optional list of expected egress IPs. Empty disables
+#                        the check (the proxy is still mandatory).
+#   modelIds           - model ids in preference order. Empty = all models the
+#                        installed pi-ai catalog describes for Anthropic.
+- insert:
+    - id: llm-claude-sub
+      name: dsh-ccsub
+      config:
+        proxy:
+          url: 'http://127.0.0.1:9077'
+          # egressAllow: [] + requireEgressCheck: true (schema default) pins
+          # the first observed egress IP for the session and refuses drift.
+        claudeCliVersion: 'auto'
+        refreshSkewMs: 300000
+        quotaPollMs: 180000
