@@ -19,11 +19,7 @@
 - insert:
     - id: llm-claude-sub
       name: dsh-ccsub
-      config:
-        proxy:
-          url: 'http://127.0.0.1:9077'
-          # egressAllow: [] + requireEgressCheck: true (schema default) pins
-          # the first observed egress IP for the session and refuses drift.
-        claudeCliVersion: 'auto'
-        refreshSkewMs: 300000
-        quotaPollMs: 180000
+      # No `config` block on purpose: every field is volatile and lives in the
+      # settings store (editable from the Settings sidebar / the settings
+      # endpoint). Declaring config here makes config-editor refuse writes
+      # ("overridden by a home patch").
