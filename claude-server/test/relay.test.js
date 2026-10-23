@@ -38,7 +38,9 @@ const SSE_GZIP = gzipSync(Buffer.from(SSE_BODY));
 const quietLogger = { error() {}, warn() {}, info() {}, debug() {} };
 
 /** Start a stub upstream that records what it received. */
-async function startUpstream() {
+async function startUpstream(options = {}) {
+  const plainBody = options.body ?? SSE_BODY;
+  const gzipBody = options.body === undefined ? SSE_GZIP : gzipSync(Buffer.from(plainBody));
   const seen = [];
   const server = http.createServer((req, res) => {
     const chunks = [];
@@ -56,16 +58,16 @@ async function startUpstream() {
         res.writeHead(status, {
           'content-type': 'text/event-stream',
           'content-encoding': 'gzip',
-          'content-length': String(SSE_GZIP.length),
+          'content-length': String(gzipBody.length),
           'request-id': 'req_stub',
         });
-        res.end(SSE_GZIP);
+        res.end(gzipBody);
       } else {
         res.writeHead(status, {
           'content-type': 'text/event-stream',
           'request-id': 'req_stub',
         });
-        res.end(SSE_BODY);
+        res.end(plainBody);
       }
     });
   });
@@ -116,6 +118,7 @@ async function startServer(upstreamOrigin) {
   const origin = `http://127.0.0.1:${built.server.address().port}`;
   return {
     origin,
+    usage: built.usage,
     async close() {
       await built.dispose();
       await transport.dispose();
@@ -322,6 +325,90 @@ test('relay refuses a non-messages path without a stored grant', async () => {
     await built.dispose();
     await transport.dispose();
     await rm(dir, { recursive: true, force: true });
+    await upstream.close();
+  }
+});
+
+test('token accounting does not alter the forwarded bytes', async () => {
+  // The observer reads the same chunks the client receives. This asserts the
+  // property that makes that safe: the client's payload is byte-identical
+  // whether or not the accounting understood it.
+  const body =
+    'event: message_start\n' +
+    'data: {"type":"message_start","message":{"model":"claude-sonnet-5-5","usage":{"input_tokens":11,"output_tokens":1}}}\n\n' +
+    'event: message_delta\n' +
+    'data: {"type":"message_delta","usage":{"output_tokens":9}}\n\n' +
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = await startUpstream({ body });
+  const server = await startServer(upstream.origin);
+  try {
+    const raw = await undiciRequest(`${server.origin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${CLIENT_BEARER}` },
+      body: JSON.stringify({ model: 'claude-sonnet-5-5' }),
+    });
+    const chunks = [];
+    for await (const chunk of raw.body) chunks.push(Buffer.from(chunk));
+    assert.equal(Buffer.concat(chunks).toString('utf8'), body);
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});
+
+test('a relayed streaming call is recorded in the ledger', async () => {
+  // End-to-end through the real relay: the observer must actually receive the
+  // chunks, which a unit test on UsageObserver alone cannot prove.
+  const body =
+    'event: message_start\n' +
+    'data: {"type":"message_start","message":{"model":"claude-sonnet-5-5","usage":{"input_tokens":11,"output_tokens":1}}}\n\n' +
+    'event: message_delta\n' +
+    'data: {"type":"message_delta","usage":{"output_tokens":9}}\n\n' +
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = await startUpstream({ body });
+  const server = await startServer(upstream.origin);
+  try {
+    const raw = await undiciRequest(`${server.origin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${CLIENT_BEARER}` },
+      body: JSON.stringify({ model: 'claude-sonnet-5-5' }),
+    });
+    for await (const _ of raw.body) {
+      // Drain so the relay finishes and records.
+    }
+    const snap = server.usage.snapshot();
+    assert.equal(snap.totals.calls, 1);
+    assert.equal(snap.totals.input_tokens, 11);
+    assert.equal(snap.totals.output_tokens, 9);
+    assert.equal(snap.byModel[0].model, 'claude-sonnet-5-5');
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});
+
+test('a relayed non-streaming call is recorded in the ledger', async () => {
+  const body = JSON.stringify({
+    model: 'claude-haiku-5-5',
+    usage: { input_tokens: 5, output_tokens: 7, cache_read_input_tokens: 3 },
+  });
+  const upstream = await startUpstream({ body });
+  const server = await startServer(upstream.origin);
+  try {
+    const raw = await undiciRequest(`${server.origin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${CLIENT_BEARER}` },
+      body: JSON.stringify({ model: 'claude-haiku-5-5' }),
+    });
+    for await (const _ of raw.body) {
+      // Drain.
+    }
+    const snap = server.usage.snapshot();
+    assert.equal(snap.totals.input_tokens, 5);
+    assert.equal(snap.totals.output_tokens, 7);
+    assert.equal(snap.totals.cache_read_input_tokens, 3);
+  } finally {
+    await server.close();
     await upstream.close();
   }
 });

@@ -28,6 +28,7 @@ import { LoginSessions } from './login.js';
 import { exchangeCode, parseAuthorizationInput, refreshGrant } from './oauth.js';
 import { sanitizeBody } from './sanitize.js';
 import { hasJsonBody, upstreamFor } from './upstream.js';
+import { UsageLedger, UsageObserver } from './usage.js';
 
 /** Responses must never be cached by an intermediary. */
 const NO_STORE = 'no-store';
@@ -86,6 +87,9 @@ export function createServer(options) {
   // Console reads of the usage endpoint share this cache. Anthropic rate-limits
   // usage far more tightly than messages and its 429s persist, so an operator
   // clicking Refresh repeatedly must not translate into repeated upstream calls.
+  // Token accounting for relayed model traffic. Process memory only: see
+  // src/usage.js for why it is not persisted.
+  const usageLedger = new UsageLedger();
   const quotaCache = { at: 0, usage: undefined, error: undefined };
   const QUOTA_CACHE_MS = 5 * 60_000;
   const maxBodyBytes = config.maxBodyBytes ?? 32 * 1024 * 1024;
@@ -285,6 +289,14 @@ export function createServer(options) {
       return;
     }
 
+    // Token accounting for relayed model traffic. Read-only and cheap: the
+    // ledger is process memory, so this never touches the network and cannot
+    // trip a rate limit.
+    if (pathname === `${ADMIN_PREFIX}/usage` && req.method === 'GET') {
+      sendJson(res, 200, { ok: true, ...usageLedger.snapshot() });
+      return;
+    }
+
     if (pathname === `${ADMIN_PREFIX}/login/start` && req.method === 'POST') {
       try {
         const attempt = sessions.create();
@@ -463,7 +475,7 @@ export function createServer(options) {
       }
 
       // Everything else is a relay.
-      await relay(req, res, { config, transport, logger, accessToken, hosts });
+      await relay(req, res, { config, transport, logger, accessToken, hosts, usageLedger });
     })().catch((error) => {
       logger.error('unhandled request failure: %s', String(error));
       if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
@@ -473,6 +485,9 @@ export function createServer(options) {
 
   return {
     server,
+    // Exposed so a caller can read the accounting in-process: the console route
+    // covers the HTTP path, and tests need the same numbers without a session.
+    usage: usageLedger,
     async dispose() {
       await new Promise((resolve) => server.close(() => resolve()));
     },
@@ -487,7 +502,7 @@ export function createServer(options) {
  * back byte for byte with its framing headers intact.
  */
 async function relay(req, res, ctx) {
-  const { config, transport, logger, accessToken } = ctx;
+  const { config, transport, logger, accessToken, usageLedger } = ctx;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const target = upstreamFor(url.pathname, url.search, ctx.hosts ?? {});
 
@@ -616,9 +631,19 @@ async function relay(req, res, ctx) {
           ? createBrotliDecompress()
           : undefined;
 
+  // Token accounting runs alongside the forwarding, never in front of it: the
+  // observer reads the same bytes the client receives and every one of its own
+  // failures is swallowed. `startedAt` measures the call for the recent-calls
+  // view, not for accounting correctness.
+  const observer = hasJsonBody(url.pathname) ? new UsageObserver() : undefined;
+  const startedAt = Date.now();
+
   try {
     if (decoder === undefined) {
-      for await (const chunk of upstream.body) res.write(chunk);
+      for await (const chunk of upstream.body) {
+        observer?.observe(chunk);
+        res.write(chunk);
+      }
     } else {
       // Pipe rather than buffer: the whole point is to keep each decoded
       // fragment available to the client as soon as it arrives. `flush` keeps a
@@ -626,6 +651,7 @@ async function relay(req, res, ctx) {
       const source = Readable.from(upstream.body);
       await pipeline(source, decoder, new Writable({
         write(chunk, _encoding, callback) {
+          observer?.observe(chunk);
           res.write(chunk, callback);
         },
       }));
@@ -634,5 +660,12 @@ async function relay(req, res, ctx) {
   } catch (error) {
     logger.warn('the upstream response stream broke: %s', String(error));
     res.destroy();
+  } finally {
+    // Record even a broken stream: whatever usage Anthropic reported before the
+    // break was still consumed from the subscription.
+    const accounting = observer?.finish();
+    if (accounting !== undefined) {
+      usageLedger.record({ ...accounting, durationMs: Date.now() - startedAt });
+    }
   }
 }

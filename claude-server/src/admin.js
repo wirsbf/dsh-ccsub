@@ -215,6 +215,7 @@ export function renderAdminPage(options = {}) {
   .use { display: grid; grid-template-columns: 8rem 1fr 7rem; gap: .5rem .8rem; align-items: center; }
   .use-label { opacity: .72; text-transform: capitalize; }
   .use-val { text-align: right; font-variant-numeric: tabular-nums; opacity: .85; }
+  .subhead { font-size: .74rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .5; margin: 1rem 0 .5rem; }
   ul.models { list-style: none; margin: 0; padding: 0; display: grid; gap: .3rem; }
   ul.models li { display: flex; gap: .6rem; align-items: baseline; }
   ul.models code { flex: 1; }
@@ -260,6 +261,18 @@ export function renderAdminPage(options = {}) {
       <span class="hint" id="models-count" style="margin:0"></span>
     </div>
     <div id="models-body" style="margin-top:.8rem"><p class="hint" style="margin:0">Loading…</p></div>
+  </section>
+
+  <section>
+    <h2>Token usage</h2>
+    <div class="row" style="margin-top:0">
+      <button id="refresh-usage-tokens">Refresh</button>
+      <span class="hint" id="tokens-since" style="margin:0"></span>
+    </div>
+    <div id="tokens-body" style="margin-top:.8rem"><p class="hint" style="margin:0">Loading…</p></div>
+    <p class="hint" style="margin-bottom:0">
+      Counted from this process's relayed responses only, and reset when it restarts.
+    </p>
   </section>`
       : ''
   }
@@ -467,10 +480,144 @@ export function renderAdminPage(options = {}) {
       }
     };
 
+    // ---- token accounting ----------------------------------------------------
+    const tokensBody = document.getElementById('tokens-body');
+    const tokensSince = document.getElementById('tokens-since');
+
+    const num = (n) => (typeof n === 'number' ? n.toLocaleString() : '0');
+
+    // Each row is label / value; the same helper serves the totals and the
+    // per-model table so the two cannot drift apart in formatting.
+    const tokenRows = (totals) => {
+      const rows = [
+        ['Calls', num(totals.calls)],
+        ['Input', num(totals.input_tokens)],
+        ['Output', num(totals.output_tokens)],
+        ['Cache read', num(totals.cache_read_input_tokens)],
+        ['Cache write', num(totals.cache_creation_input_tokens)],
+      ];
+      const dl = document.createElement('dl');
+      for (const [label, value] of rows) {
+        const dt = document.createElement('dt');
+        dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = value;
+        dl.append(dt, dd);
+      }
+      return dl;
+    };
+
+    const renderTokens = (data) => {
+      tokensBody.innerHTML = '';
+      const totals = data.totals || {};
+      if (!totals.calls) {
+        const p = document.createElement('p');
+        p.className = 'hint';
+        p.style.margin = '0';
+        p.textContent = 'No relayed calls since this process started.';
+        tokensBody.append(p);
+        return;
+      }
+      tokensBody.append(tokenRows(totals));
+
+      const models = data.byModel || [];
+      if (models.length > 0) {
+        const h = document.createElement('h3');
+        h.className = 'subhead';
+        h.textContent = 'By model';
+        tokensBody.append(h);
+        const table = document.createElement('div');
+        table.className = 'use';
+        // Header row reuses the same grid so columns line up with the totals.
+        for (const [label, value] of [
+          ['Model', ''],
+          ['In / Out', ''],
+          ['Cache r/w', ''],
+        ]) {
+          const a = document.createElement('span');
+          a.className = 'use-label';
+          a.textContent = label;
+          const b = document.createElement('span');
+          b.className = 'hint';
+          b.style.margin = '0';
+          b.textContent = value;
+          const c = document.createElement('span');
+          c.className = 'use-val';
+          c.textContent = value;
+          table.append(a, b, c);
+        }
+        for (const row of models) {
+          const a = document.createElement('span');
+          a.className = 'use-label';
+          a.textContent = row.model;
+          const b = document.createElement('span');
+          b.className = 'hint';
+          b.style.margin = '0';
+          b.textContent = num(row.input_tokens) + ' / ' + num(row.output_tokens);
+          const c = document.createElement('span');
+          c.className = 'use-val';
+          c.textContent = num(row.cache_read_input_tokens) + ' / ' + num(row.cache_creation_input_tokens);
+          table.append(a, b, c);
+        }
+        tokensBody.append(table);
+      }
+
+      const recent = data.recent || [];
+      if (recent.length > 0) {
+        const h = document.createElement('h3');
+        h.className = 'subhead';
+        h.textContent = 'Recent calls';
+        tokensBody.append(h);
+        const list = document.createElement('ul');
+        list.className = 'models';
+        for (const call of recent.slice(0, 10)) {
+          const li = document.createElement('li');
+          const time = document.createElement('code');
+          time.textContent = new Date(call.at).toLocaleTimeString();
+          const model = document.createElement('span');
+          model.className = 'hint';
+          model.style.margin = '0';
+          model.textContent = call.model || '(unknown)';
+          const counts = document.createElement('span');
+          counts.className = 'use-val';
+          counts.textContent =
+            num(call.input_tokens) + ' in / ' + num(call.output_tokens) + ' out' +
+            (call.durationMs === null ? '' : ' · ' + (call.durationMs / 1000).toFixed(1) + 's');
+          li.append(time, model, counts);
+          list.append(li);
+        }
+        tokensBody.append(list);
+      }
+    };
+
+    const loadTokens = async () => {
+      tokensSince.textContent = 'loading…';
+      try {
+        const r = await fetch('/admin/usage', { credentials: 'same-origin' });
+        const body = await r.json().catch(() => null);
+        if (!r.ok) {
+          tokensBody.innerHTML = '';
+          const p = document.createElement('p');
+          p.className = 'msg err';
+          p.style.margin = '0';
+          p.textContent = (body && body.error) || ('HTTP ' + r.status);
+          tokensBody.append(p);
+          tokensSince.textContent = '';
+          return;
+        }
+        renderTokens(body);
+        tokensSince.textContent = 'since ' + new Date(body.since).toLocaleString();
+      } catch (e) {
+        tokensSince.textContent = String(e.message || e);
+      }
+    };
+
     document.getElementById('refresh-usage').addEventListener('click', () => void loadUsage());
     document.getElementById('refresh-models').addEventListener('click', () => void loadModels());
+    document.getElementById('refresh-usage-tokens').addEventListener('click', () => void loadTokens());
     void loadUsage();
     void loadModels();
+    void loadTokens();
 
     const start = document.getElementById('start');
     const cancel = document.getElementById('cancel');

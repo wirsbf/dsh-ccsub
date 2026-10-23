@@ -216,6 +216,9 @@ cp -r package.json cordis.patch.yml icon.svg README.md lib locale /tmp/ccsub-pac
 | `POST /plugins/dsh-ccsub/logout` | Delete the stored grant |
 | `POST /plugins/dsh-ccsub/server/bearer` | Store or clear the claude-server client bearer |
 
+The server's own console adds `GET /admin/usage`, which reports the token
+accounting described in [`claude-server/`](claude-server/).
+
 ## Layout
 
 ```
@@ -232,8 +235,8 @@ lib/
   client/index.js   Browser settings card
 
 claude-server/      The separate subscription server (see its own README)
-  src/              identity, grant, oauth, auth, sanitize, transport, relay
-  test/             47 offline checks; no network
+  src/              identity, grant, oauth, auth, sanitize, transport, relay, usage
+  test/             63 offline checks; no network
 ```
 
 ## Credits

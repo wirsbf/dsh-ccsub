@@ -191,6 +191,9 @@ cp -r package.json cordis.patch.yml icon.svg README.md lib locale /tmp/ccsub-pac
 | `POST /plugins/dsh-ccsub/logout` | 删除已存储的凭据 |
 | `POST /plugins/dsh-ccsub/server/bearer` | 写入或清除 claude-server 的通信密钥 |
 
+服务端自己的控制台另有 `GET /admin/usage`，报告 [`claude-server/`](claude-server/)
+里的 token 统计。
+
 ## 目录结构
 
 ```
@@ -207,8 +210,8 @@ lib/
   client/index.js   浏览器设置卡片
 
 claude-server/      独立的订阅服务端（见它自己的 README）
-  src/              身份、凭据、oauth、鉴权、净化、传输、转发
-  test/             47 项离线检查；不走网络
+  src/              身份、凭据、oauth、鉴权、净化、传输、转发、用量统计
+  test/             63 项离线检查；不走网络
 ```
 
 ## 致谢
