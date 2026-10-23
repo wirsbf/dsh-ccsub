@@ -294,7 +294,7 @@ do not leak into an installed release.
 
 A healthy install prints `Packages: +1` and exits 0. If it instead reports
 `[ERR_PNPM_IGNORED_BUILDS]` and a few dozen packages, you are installing a build
-from before 0.2.0 — that build pulled its own pi-ai, and its transitive
+from before 0.2.1 — that build pulled its own pi-ai, and its transitive
 `@google/genai`/`protobufjs` build scripts are what pnpm refuses. Rebuild from
 the current tree rather than working around it with
 `--config.strict-dep-builds=false`: the bypass gets the bundle registered but

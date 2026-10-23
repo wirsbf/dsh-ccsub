@@ -254,7 +254,7 @@ dsh plugin --profile web add /绝对路径/dsh-ccsub-<version>.tgz
 > 没有这层前缀时 pnpm 会把文件摊平到安装根目录，`exports` 里的路径就全部 404。
 
 安装健康的话会打印 `Packages: +1` 并以 0 退出。如果反而报
-`[ERR_PNPM_IGNORED_BUILDS]` 并装了上百个包，说明你装的是 0.2.0 之前的构建——那个
+`[ERR_PNPM_IGNORED_BUILDS]` 并装了上百个包，说明你装的是 0.2.1 之前的构建——那个
 构建会拉自己的 pi-ai，而它传递依赖的 `@google/genai`/`protobufjs` 构建脚本正是 pnpm
 拒绝执行的东西。请用当前源码重新打包，不要用
 `--config.strict-dep-builds=false` 绕过：这样能让 bundle 注册上，但重复的 pi-ai 还在，
