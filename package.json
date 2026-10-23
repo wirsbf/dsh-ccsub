@@ -1,6 +1,6 @@
 {
   "name": "dsh-ccsub",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Claude Pro/Max subscription route for DSH: browser OAuth (PKCE), quota panel, egress-guarded transport.",
@@ -30,15 +30,14 @@
       "platform": "web"
     }
   },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "3.18.4",
-    "@earendil-works/pi-ai": "^0.87.1",
-    "undici": "^8.10.0"
-  },
+  "dependencies": {},
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-credentials": "0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1 || 0.2.1-rc.2",
     "@deepseek-ai/dsh-llm": "0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1 || 0.2.1-rc.2",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1 || 0.2.1-rc.2"
+    "@deepseek-ai/dsh-llm-pi-ai": "0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-alpha.1 || 0.2.1-rc.2",
+    "@deepseek-ai/schemastery": ">=3.18.4 <4",
+    "@earendil-works/pi-ai": ">=0.87.1 <2",
+    "undici": ">=8.10.0 <9"
   }
 }

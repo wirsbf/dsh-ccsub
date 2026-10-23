@@ -179,28 +179,129 @@ into every settings export.
 
 ## Install
 
+### From another machine (the common case)
+
+If a `claude-server` deployment already owns the subscription, a second machine
+needs only this plugin and two values — **no proxy, no subscription token**:
+
+```bash
+# 1. Get the package onto that machine (this repo is not published to npm).
+#    Either copy the directory, clone it, or install a tarball built below.
+git clone https://github.com/wirsbf/dsh-ccsub.git ~/DEV/dsh-ccsub
+
+# 2. Install it into that machine's profile.
+#    Via the agent tool (preferred — it owns package.json and the bundle list):
+#      plugin_manager → install_bundle, target = /home/<user>/DEV/dsh-ccsub
+#    Or via the CLI, which forwards to pnpm in the profile directory:
+dsh plugin --profile web add /home/<user>/DEV/dsh-ccsub
+```
+
+Restart the host, then fill in exactly two fields in **Settings → Claude
+Subscription**:
+
+| Field | Value |
+|---|---|
+| Mode | `claude-server` |
+| Server URL | the deployment's origin, e.g. `https://claude.example.com` |
+| Client bearer | the server's `CLIENT_BEARER` env value |
+
+The bearer paste box is the whole sign-in flow in this mode: there is no browser
+OAuth step, because the server already holds the grant and refreshes it. A
+`GET <server>/healthz` returning `{"ok":true,"signedIn":true}` confirms the
+server half is ready before you paste anything.
+
+Two things that are easy to get wrong here:
+
+- **Do not copy a configuration file between machines.** The bearer is stored as
+  an `api-key` record in that machine's credential store, never in
+  `cordis.patch.yml`, so a copied config carries no credential and the route
+  answers `NOT_CONFIGURED`.
+- **Choose `claude-server`, not `direct`.** `direct` expects a subscription
+  token and a reachable proxy on the local machine; on a client machine that has
+  neither, it fails with the same `NOT_CONFIGURED` code and the proxy block
+  appears to be the problem when the mode is.
+
+The `proxy` block is unused in `claude-server` mode by design — the egress IP
+that Anthropic observes is the server's, so a local proxy would change nothing
+while adding a failure mode.
+
+### From the source directory
+
 Install the **package directory** through the harness plugin manager
 (`plugin_manager` → `install_bundle`, target = this directory). The manager owns
 the profile's `package.json` and bundle list; do not edit them by hand.
 
-Because the manager installs this package as a **link** to the source directory,
-Node resolves its dependencies from *here*, not from the profile. The real
-runtime dependencies (`@earendil-works/pi-ai`, `undici`, `@deepseek-ai/schemastery`)
-are declared in `package.json`; `@deepseek-ai/cordis`, `dsh-credentials`,
-`dsh-llm`, and `dsh-llm-pi-ai` are peer dependencies supplied by the harness.
+**Every package this plugin imports is a peer dependency.** It ships no
+`dependencies` at all, and that is deliberate.
 
-Authoring directly in the linked directory means edits take effect on the next
-host restart (a replaced package needs a fresh module generation). Pack and
-install a tarball instead when you want an immutable artifact:
+The harness already supplies all of them: `dsh-app-boot` puts any package
+reachable from the dsh manifest — `@earendil-works/pi-ai`, `undici`,
+`@deepseek-ai/schemastery`, `cordis`, `dsh-llm`, `dsh-llm-pi-ai`,
+`dsh-credentials` — into the *installation scope*, and the runtime resolver
+routes a plugin's bare imports to those copies. Declaring one as a regular
+dependency is what breaks that: pnpm then installs a **private copy** inside the
+plugin, Node resolves it before the resolver ever gets a say, and the process
+ends up with two copies of the same module.
+
+For pi-ai that is fatal, not merely wasteful. This plugin builds a provider with
+`createProvider`/`anthropicProvider` and hands it to the harness's `PiAiAdapter`,
+so both sides must share one instance of the type contract. With a private
+0.87.1 next to the harness's 1.4.0 the model route fails deep inside the stream,
+which is why the plugin reports drift at startup and on `/status`.
+
+A second effect matters on install: pi-ai 0.87.x depends on `@google/genai`,
+which depends on `protobufjs`, and both carry build scripts. pnpm 11 treats
+unapproved build scripts as a failure (`strict-dep-builds`), so the install exits
+non-zero — and `dsh plugin add` only re-registers the bundle on exit 0, leaving
+the package installed but **inactive**. Shipping zero dependencies removes the
+whole failure mode: the install is a single package, `Packages: +1`, no build
+scripts, exit 0.
+
+The trade-off is that the plugin cannot pin pi-ai itself, so an older harness
+supplies an older pi-ai. `dependencyReport()` covers that: it resolves the copy
+actually loaded through the runtime resolver and reports `compatible: false` on
+`/status` when it does not satisfy what `dsh-llm-pi-ai` requires.
+
+## Packaging a release
+
+`npm pack` is the whole release build: it honours `package.json`'s `files` list,
+always adds `README*`, `LICENSE` and `package.json`, and writes the `package/`
+prefix pnpm needs. No build step, no bundler — `lib/` ships as authored.
 
 ```bash
-mkdir -p /tmp/ccsub-pack/package
-cp -r package.json cordis.patch.yml icon.svg README.md lib locale /tmp/ccsub-pack/package/
-(cd /tmp/ccsub-pack && tar czf dsh-ccsub-<version>.tgz package)
+npm pack                      # → dsh-ccsub-<version>.tgz
+sha256sum dsh-ccsub-<version>.tgz > SHA256SUMS
 ```
 
-> The `package/` prefix matters: a tarball without it makes pnpm flatten the
-> files into the install root, and the `exports` paths then 404.
+`private: true` blocks `npm publish` but does **not** block `npm pack`, so a
+release tarball works with the flag left in place. Keep it there: it is what
+stops an accidental publish of a package whose whole point is local use.
+
+Install that tarball on any machine:
+
+```bash
+# via the agent tool:  plugin_manager → install_bundle, spec = /abs/path/<file>.tgz
+dsh plugin --profile web add /abs/path/dsh-ccsub-<version>.tgz
+```
+
+The install lands in the profile's store as an immutable artifact (a pnpm
+symlink into `.pnpm/`, not a link back to this source tree), so later edits here
+do not leak into an installed release.
+
+> Verify before handing it out: `tar tzf <file>.tgz | head` must show a single
+> top-level `package/` directory. A tarball without it makes pnpm flatten the
+> files into the install root and every `exports` path then 404.
+
+A healthy install prints `Packages: +1` and exits 0. If it instead reports
+`[ERR_PNPM_IGNORED_BUILDS]` and a few dozen packages, you are installing a build
+from before 0.2.0 — that build pulled its own pi-ai, and its transitive
+`@google/genai`/`protobufjs` build scripts are what pnpm refuses. Rebuild from
+the current tree rather than working around it with
+`--config.strict-dep-builds=false`: the bypass gets the bundle registered but
+leaves the duplicate pi-ai in place, so the route still fails at request time.
+
+For authoring directly in a linked directory instead, see the section above;
+edits there take effect on the next host restart.
 
 ## Configuration surface
 

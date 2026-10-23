@@ -156,26 +156,111 @@ bearer 通过 harness 的凭据面存储为 `api-key` 记录，**不写在这份
 
 ## 安装
 
+### 在另一台机器上安装（最常见的用法）
+
+如果已经有一个 `claude-server` 部署持有订阅，第二台机器只需要装本插件并填**两个值**
+——**不需要代理，也不需要在本地持有订阅 token**：
+
+```bash
+# 1. 把包放到那台机器上（本仓库没有发布到 npm）。
+#    复制目录、clone，或者用下面打包好的 tarball 都行。
+git clone https://github.com/wirsbf/dsh-ccsub.git ~/DEV/dsh-ccsub
+
+# 2. 装进那台机器的 profile。
+#    优先用 agent 工具（它负责 package.json 和 bundle 列表）：
+#      plugin_manager → install_bundle，target = /home/<user>/DEV/dsh-ccsub
+#    或者用 CLI，它会转给 profile 目录里的 pnpm：
+dsh plugin --profile web add /home/<user>/DEV/dsh-ccsub
+```
+
+重启 host，然后在**设置 → Claude Subscription** 里只填两个字段：
+
+| 字段 | 值 |
+|---|---|
+| Mode（模式） | `claude-server` |
+| Server URL（服务器地址） | 部署的 origin，例如 `https://claude.example.com` |
+| Client bearer（客户端 bearer） | 服务器启动时设的 `CLIENT_BEARER` 值 |
+
+这个模式下，粘贴 bearer 就是全部登录流程：没有浏览器 OAuth 那一步，因为授权
+（grant）已经在服务器上，并由服务器负责刷新。粘贴之前先确认服务器就绪：
+`GET <server>/healthz` 返回 `{"ok":true,"signedIn":true}` 即可。
+
+两处最容易踩错的地方：
+
+- **不要把配置文件改名复制到另一台机器。** bearer 是以 `api-key` 记录存在那台机器
+  自己的凭证库里的，从不在 `cordis.patch.yml` 中，所以复制来的配置不携带任何凭据，
+  路由会直接报 `NOT_CONFIGURED`。
+- **选 `claude-server`，不是 `direct`。** `direct` 要求本机持有订阅 token 且代理可达；
+  客户端机器两样都没有，同样会报 `NOT_CONFIGURED`，于是看起来像是代理块配错了，
+  实际是模式选错了。
+
+`claude-server` 模式下 `proxy` 块按设计不生效——Anthropic 看到的出口 IP 是服务器的，
+本地再套一层代理不会改变任何可观测结果，只会多一个失败点。
+
+### 从源码目录安装
+
 通过 harness 的插件管理器安装**本包目录**（`plugin_manager` → `install_bundle`，
 target 指向这个目录）。管理器负责 profile 的 `package.json` 和 bundle 列表，不要
 手工改它们。
 
-由于管理器是以 **link** 方式安装本包指向源码目录，Node 解析依赖时是从*这里*而不是
-从 profile 解析。运行时真依赖（`@earendil-works/pi-ai`、`undici`、
-`@deepseek-ai/schemastery`）声明在 `package.json` 里；`@deepseek-ai/cordis`、
-`dsh-credentials`、`dsh-llm`、`dsh-llm-pi-ai` 是由 harness 提供的 peer 依赖。
+**本插件 import 的每一个包都是 peer 依赖。**它的 `dependencies` 是空的，这是刻意的。
 
-直接在 link 目录里改动，会在下次 host 重启时生效（被替换的包需要新的模块代际）。
-想要不可变的产物，就打包安装 tarball：
+这些包 harness 全都自带：`dsh-app-boot` 把从 dsh 清单可达的所有包——`@earendil-works/pi-ai`、
+`undici`、`@deepseek-ai/schemastery`、`cordis`、`dsh-llm`、`dsh-llm-pi-ai`、
+`dsh-credentials`——放进**安装作用域**，运行时解析器再把插件的裸 import 路由到这些副本上。
+把它们写成普通依赖恰好会破坏这一点：pnpm 会在插件内部装一份**私有副本**，Node 在解析器
+介入之前就命中了它，于是进程里出现两份同一个模块。
+
+对 pi-ai 来说这不只是浪费，而是致命的。本插件用 `createProvider`/`anthropicProvider`
+造出 provider 再交给 harness 的 `PiAiAdapter`，两边必须共享同一个类型契约实例。
+插件私有 0.87.1 与 harness 的 1.4.0 并存时，模型请求会在流内部深处失败——这正是插件
+在启动和 `/status` 上报 drift 的原因。
+
+第二个影响出现在安装环节：pi-ai 0.87.x 依赖 `@google/genai`，后者又依赖 `protobufjs`，
+两者都带构建脚本。pnpm 11 把未批准的构建脚本当作失败（`strict-dep-builds`），安装因此
+返回非零码；而 `dsh plugin add` 只在退出码为 0 时才重新注册 bundle，结果就是包装上了、
+但**没激活**。零依赖把这个失败模式整个消掉：安装只有一个包，`Packages: +1`，没有构建
+脚本，退出码 0。
+
+代价是插件无法自己钉住 pi-ai 版本，老版本 harness 就会提供老的 pi-ai。这一点由
+`dependencyReport()` 兜住：它通过运行时解析器取出**实际被加载**的那一份，不满足
+`dsh-llm-pi-ai` 要求时在 `/status` 上报 `compatible: false`。
+
+## 打包发布
+
+`npm pack` 就是完整的发布构建：它按 `package.json` 的 `files` 挑文件，自动补上
+`README*`、`LICENSE` 和 `package.json`，并生成 pnpm 需要的 `package/` 前缀。没有
+构建步骤、没有打包器——`lib/` 按源码原样发布。
 
 ```bash
-mkdir -p /tmp/ccsub-pack/package
-cp -r package.json cordis.patch.yml icon.svg README.md lib locale /tmp/ccsub-pack/package/
-(cd /tmp/ccsub-pack && tar czf dsh-ccsub-<version>.tgz package)
+npm pack                      # → dsh-ccsub-<version>.tgz
+sha256sum dsh-ccsub-<version>.tgz > SHA256SUMS
 ```
 
-> `package/` 这层前缀很重要：没有它 pnpm 会把文件摊平到安装根目录，
-> 于是 `exports` 里的路径全部 404。
+`private: true` 只挡 `npm publish`，**不挡** `npm pack`，所以留着这个标记照样能出
+发布产物。建议留着：它是防止误发布的安全阀，而这个包的定位本就是本地使用。
+
+在任意机器上安装该 tarball：
+
+```bash
+# 用 agent 工具：plugin_manager → install_bundle，spec = /绝对路径/<文件名>.tgz
+dsh plugin --profile web add /绝对路径/dsh-ccsub-<version>.tgz
+```
+
+安装后会作为不可变产物进入 profile 的 store（pnpm 指向 `.pnpm/` 的符号链接，而不是
+链回这棵源码树），所以之后在源码目录里的改动不会漏进已安装的发行包。
+
+> 交付前先验证：`tar tzf <文件>.tgz | head` 必须只显示一个顶层 `package/` 目录。
+> 没有这层前缀时 pnpm 会把文件摊平到安装根目录，`exports` 里的路径就全部 404。
+
+安装健康的话会打印 `Packages: +1` 并以 0 退出。如果反而报
+`[ERR_PNPM_IGNORED_BUILDS]` 并装了上百个包，说明你装的是 0.2.0 之前的构建——那个
+构建会拉自己的 pi-ai，而它传递依赖的 `@google/genai`/`protobufjs` 构建脚本正是 pnpm
+拒绝执行的东西。请用当前源码重新打包，不要用
+`--config.strict-dep-builds=false` 绕过：这样能让 bundle 注册上，但重复的 pi-ai 还在，
+请求时照样失败。
+
+如果你是想在 link 目录里直接开发，看上面那节；那里的改动在下次 host 重启时生效。
 
 ## 配置接口
 
