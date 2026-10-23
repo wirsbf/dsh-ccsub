@@ -1,5 +1,7 @@
 # dsh-ccsub — Claude Subscription route for DSH
 
+English | [中文](README.zh.md)
+
 Registers one `LlmAdapter` route, **`claude-sub`**, that sends model requests to
 Anthropic using a **Claude Pro/Max subscription** obtained through the official
 browser OAuth flow. Ships a settings card with the subscription's rate-limit
@@ -231,7 +233,7 @@ lib/
 
 claude-server/      The separate subscription server (see its own README)
   src/              identity, grant, oauth, auth, sanitize, transport, relay
-  test/             28 offline checks; no network
+  test/             47 offline checks; no network
 ```
 
 ## Credits
