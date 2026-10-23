@@ -4,6 +4,8 @@
 # matches directories, so the symlink would otherwise be committed.
 node_modules
 *.tgz
+# Release checksum written next to the tarball by the packaging step.
+*.tgz.sha256
 .DS_Store
 
 # Local secrets. `claude-server/.gitignore` covers its own env files; these
