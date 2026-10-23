@@ -28,6 +28,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import { ADMIN_STYLE } from './admin-style.js';
 
 /** Cookie name for the console session. */
 export const ADMIN_COOKIE = 'claude_server_admin';
@@ -145,97 +146,22 @@ export function renderAdminPage(options = {}) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>claude-server · console</title>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 2rem 1rem;
-    font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: #0f1115; color: #e6e8ee;
-  }
-  @media (prefers-color-scheme: light) { body { background: #f6f7f9; color: #1c1f26; } }
-  main { max-width: 44rem; margin: 0 auto; }
-  h1 { font-size: 1.15rem; margin: 0 0 .35rem; letter-spacing: -.01em; }
-  .sub { margin: 0 0 1.5rem; opacity: .62; }
-  section {
-    border: 1px solid #2a2f3a; border-radius: 10px;
-    padding: 1rem 1.1rem; margin: 0 0 1rem; background: #161a21;
-  }
-  @media (prefers-color-scheme: light) { section { border-color: #dfe3ea; background: #fff; } }
-  h2 { font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .55; margin: 0 0 .8rem; }
-  dl { display: grid; grid-template-columns: 9rem 1fr; gap: .4rem .8rem; margin: 0; }
-  dt { opacity: .6; }
-  dd { margin: 0; font-variant-numeric: tabular-nums; }
-  .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .78rem; font-weight: 600; }
-  .on { background: #14361f; color: #6ee7a0; }
-  .off { background: #3a1d1d; color: #f6a3a3; }
-  @media (prefers-color-scheme: light) {
-    .on { background: #dcfce7; color: #15803d; }
-    .off { background: #fee2e2; color: #b91c1c; }
-  }
-  label { display: block; margin: 0 0 .3rem; opacity: .7; }
-  input[type=text], input[type=password] {
-    width: 100%; padding: .55rem .65rem; border-radius: 7px;
-    border: 1px solid #333a47; background: #0d1015; color: inherit; font: inherit;
-  }
-  @media (prefers-color-scheme: light) {
-    input[type=text], input[type=password] { border-color: #cfd6e0; background: #fff; }
-  }
-  .row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin-top: .7rem; }
-  button {
-    padding: .5rem .85rem; border-radius: 7px; border: 1px solid #3b4255;
-    background: #232936; color: inherit; font: inherit; cursor: pointer;
-  }
-  button:hover { background: #2c3444; }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  button.primary { background: #2f6df6; border-color: #2f6df6; color: #fff; }
-  button.primary:hover { background: #3b78ff; }
-  button.danger { border-color: #7f2b2b; color: #f6a3a3; }
-  button.danger:hover { background: #2a1a1a; }
-  @media (prefers-color-scheme: light) {
-    button { border-color: #cfd6e0; background: #f1f3f7; }
-    button:hover { background: #e6eaf1; }
-    button.primary { background: #2f6df6; border-color: #2f6df6; color: #fff; }
-    button.danger { border-color: #f0b4b4; color: #b91c1c; }
-    button.danger:hover { background: #fdeaea; }
-  }
-  .hint { opacity: .55; font-size: .86rem; margin: .55rem 0 0; }
-  .msg { margin: 0 0 1rem; padding: .6rem .8rem; border-radius: 7px; font-size: .9rem; }
-  .msg.ok { background: #14361f; color: #6ee7a0; }
-  .msg.err { background: #3a1d1d; color: #f6a3a3; }
-  @media (prefers-color-scheme: light) {
-    .msg.ok { background: #dcfce7; color: #15803d; }
-    .msg.err { background: #fee2e2; color: #b91c1c; }
-  }
-  .meter { height: 6px; border-radius: 999px; background: #2a2f3a; overflow: hidden; margin: .35rem 0 .15rem; }
-  @media (prefers-color-scheme: light) { .meter { background: #e3e7ee; } }
-  .meter > span { display: block; height: 100%; border-radius: 999px; background: #2f6df6; }
-  .meter > span.warn { background: #d97706; }
-  .meter > span.over { background: #dc2626; }
-  .use { display: grid; grid-template-columns: 8rem 1fr 7rem; gap: .5rem .8rem; align-items: center; }
-  .use-label { opacity: .72; text-transform: capitalize; }
-  .use-val { text-align: right; font-variant-numeric: tabular-nums; opacity: .85; }
-  .subhead { font-size: .74rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; opacity: .5; margin: 1rem 0 .5rem; }
-  ul.models { list-style: none; margin: 0; padding: 0; display: grid; gap: .3rem; }
-  ul.models li { display: flex; gap: .6rem; align-items: baseline; }
-  ul.models code { flex: 1; }
-  ul.models .pill { font-size: .7rem; }
-  code { font: .86em ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
-  a { color: inherit; }
-</style>
+<style>${ADMIN_STYLE}</style>
 </head>
 <body>
 <main>
-  <h1>claude-server · console</h1>
-  <p class="sub">Manage the Claude subscription this server holds.</p>
+  <header class="masthead">
+    <h1><span class="mark" aria-hidden="true"></span>claude-server</h1>
+    <p>Manage the Claude subscription this server holds.</p>
+  </header>
   ${notice === '' ? '' : `<p class="msg ok">${esc(notice)}</p>`}
   ${error === '' ? '' : `<p class="msg err">${esc(error)}</p>`}
 
-  <section>
+  <section class="card">
     <h2>State</h2>
-    <dl>
+    <dl class="facts">
       <dt>Signed in</dt>
-      <dd><span class="pill ${signedIn ? 'on' : 'off'}">${signedIn ? 'yes' : 'no'}</span></dd>
+      <dd><span class="pill ${signedIn ? 'on' : 'off'}">${signedIn ? 'signed in' : 'not signed in'}</span></dd>
       <dt>Access expires</dt>
       <dd>${signedIn ? esc(expiry) : '—'}</dd>
       <dt>Upstream mode</dt>
@@ -245,68 +171,56 @@ export function renderAdminPage(options = {}) {
 
   ${
     authed
-      ? `<section>
-    <h2>Subscription limits</h2>
-    <div class="row" style="margin-top:0">
-      <button id="refresh-usage">Refresh</button>
-      <span class="hint" id="usage-age" style="margin:0"></span>
-    </div>
-    <div id="usage-body" style="margin-top:.8rem"><p class="hint" style="margin:0">Loading…</p></div>
+      ? `<section class="card">
+    <h2>Subscription limits<span class="actions"><span class="hint" id="usage-age" style="margin:0"></span><button class="small" id="refresh-usage">Refresh</button></span></h2>
+    <div id="usage-body"><p class="empty">Loading…</p></div>
   </section>
 
-  <section>
-    <h2>Models</h2>
-    <div class="row" style="margin-top:0">
-      <button id="refresh-models">Refresh</button>
-      <span class="hint" id="models-count" style="margin:0"></span>
-    </div>
-    <div id="models-body" style="margin-top:.8rem"><p class="hint" style="margin:0">Loading…</p></div>
+  <section class="card">
+    <h2>Models<span class="actions"><span class="hint" id="models-count" style="margin:0"></span><button class="small" id="refresh-models">Refresh</button></span></h2>
+    <div id="models-body"><p class="empty">Loading…</p></div>
   </section>
 
-  <section>
-    <h2>Token usage</h2>
-    <div class="row" style="margin-top:0">
-      <button id="refresh-usage-tokens">Refresh</button>
-      <span class="hint" id="tokens-since" style="margin:0"></span>
-    </div>
-    <div id="tokens-body" style="margin-top:.8rem"><p class="hint" style="margin:0">Loading…</p></div>
-    <p class="hint" style="margin-bottom:0">
-      Counted from this process's relayed responses only, and reset when it restarts.
-    </p>
+  <section class="card">
+    <h2>Token usage<span class="actions"><span class="hint" id="tokens-since" style="margin:0"></span><button class="small" id="refresh-usage-tokens">Refresh</button></span></h2>
+    <div id="tokens-body"><p class="empty">Loading…</p></div>
+    <p class="note">Counted from responses relayed by this process, and reset when it restarts.</p>
   </section>`
       : ''
   }
 
   ${
     authed
-      ? `<section>
+      ? `<section class="card">
     <h2>Sign in to Claude</h2>
-    <p class="hint" style="margin-top:0">
+    <p class="note" style="margin:0 0 var(--s-3)">
       Opens Anthropic's authorize page in a new tab. After you approve, the browser lands on a
       <code>localhost</code> address that is not served — copy that full address from the bar and paste it below.
     </p>
-    <div class="row">
+    <div class="row top">
       <button class="primary" id="start">Start sign-in</button>
       <button id="cancel" disabled>Cancel pending</button>
     </div>
-    <div id="stage" style="margin-top:.9rem"></div>
+    <div id="stage"></div>
   </section>
 
-  <section>
+  <section class="card">
     <h2>Session</h2>
-    <div class="row">
-      <button id="forget">Sign out of console</button>
+    <div class="row top">
+      <button class="danger" id="forget">Sign out of console</button>
     </div>
-    <p class="hint">Ends this browser session only. The Claude grant stays on the server.</p>
+    <p class="note">Ends this browser session only. The Claude grant stays on the server.</p>
   </section>`
       : `<section>
     <h2>Unlock</h2>
-    <p class="hint" style="margin-top:0">
+    <p class="note" style="margin:0 0 var(--s-3)">
       Paste this server's <code>CLIENT_BEARER</code>. It is verified once and exchanged for an
       <code>HttpOnly</code> session cookie; it is never stored in the page or echoed back.
     </p>
-    <label for="bearer">Client bearer</label>
-    <input id="bearer" type="password" autocomplete="off" spellcheck="false" placeholder="at least 24 characters">
+    <div class="field">
+      <label for="bearer">Client bearer</label>
+      <input id="bearer" type="password" autocomplete="off" spellcheck="false" placeholder="at least 24 characters">
+    </div>
     <div class="row">
       <button class="primary" id="unlock">Unlock</button>
     </div>
@@ -382,21 +296,36 @@ export function renderAdminPage(options = {}) {
       return out;
     };
 
+    /** Human-readable name for a limit window key. */
+    const windowName = (label) =>
+      String(label).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+
     const renderUsage = (usage) => {
       const rows = windowsOf(usage);
       if (rows.length === 0) {
-        usageBody.innerHTML = '<p class="hint" style="margin:0">No limit windows reported.</p>';
+        usageBody.innerHTML = '<p class="empty">No limit windows reported.</p>';
         return;
       }
-      const wrap = document.createElement('div');
-      wrap.className = 'use';
+      usageBody.innerHTML = '';
       for (const row of rows) {
-        const label = document.createElement('span');
-        label.className = 'use-label';
-        label.textContent = row.label;
+        const box = document.createElement('div');
+        box.className = 'window';
+
+        const head = document.createElement('div');
+        head.className = 'window-head';
+        const name = document.createElement('span');
+        name.className = 'window-name';
+        name.textContent = windowName(row.label);
+        const figure = document.createElement('span');
+        figure.className = 'window-figure';
+        figure.textContent = row.percent.toFixed(0) + '%';
+        head.append(name, figure);
 
         const bar = document.createElement('div');
         bar.className = 'meter';
+        // The meter is decorative; the figure above and the reset line below
+        // carry the same information as text, so this needs no ARIA role.
+        bar.setAttribute('aria-hidden', 'true');
         const fill = document.createElement('span');
         const pct = Math.max(0, Math.min(100, row.percent));
         fill.style.width = pct + '%';
@@ -404,15 +333,16 @@ export function renderAdminPage(options = {}) {
         else if (pct >= 70) fill.className = 'warn';
         bar.append(fill);
 
-        const val = document.createElement('span');
-        val.className = 'use-val';
-        val.textContent = row.percent.toFixed(0) + '%' +
-          (row.resetsAt ? ' · resets ' + new Date(row.resetsAt).toLocaleString() : '');
+        box.append(head, bar);
 
-        wrap.append(label, bar, val);
+        if (row.resetsAt) {
+          const reset = document.createElement('p');
+          reset.className = 'window-reset';
+          reset.textContent = 'Resets ' + new Date(row.resetsAt).toLocaleString();
+          box.append(reset);
+        }
+        usageBody.append(box);
       }
-      usageBody.innerHTML = '';
-      usageBody.append(wrap);
     };
 
     const loadUsage = async () => {
@@ -456,25 +386,43 @@ export function renderAdminPage(options = {}) {
           modelsCount.textContent = '';
           return;
         }
-        const list = document.createElement('ul');
-        list.className = 'models';
-        for (const model of body.models || []) {
-          const li = document.createElement('li');
+        const models = body.models || [];
+        if (models.length === 0) {
+          modelsBody.innerHTML = '<p class="empty">The endpoint reported no models.</p>';
+          modelsCount.textContent = '';
+          return;
+        }
+        // A table rather than a list: the id and its display name are two
+        // columns of the same fact, and aligning them makes a long catalog
+        // scannable.
+        const table = document.createElement('table');
+        table.className = 'grid';
+        const head = document.createElement('thead');
+        const headRow = document.createElement('tr');
+        for (const label of ['Model id', 'Name']) {
+          const th = document.createElement('th');
+          th.textContent = label;
+          headRow.append(th);
+        }
+        head.append(headRow);
+        const bodyEl = document.createElement('tbody');
+        for (const model of models) {
+          const tr = document.createElement('tr');
+          const idCell = document.createElement('td');
+          idCell.className = 'name';
           const code = document.createElement('code');
           code.textContent = model.id;
-          li.append(code);
-          if (model.displayName && model.displayName !== model.id) {
-            const name = document.createElement('span');
-            name.className = 'hint';
-            name.style.margin = '0';
-            name.textContent = model.displayName;
-            li.append(name);
-          }
-          list.append(li);
+          idCell.append(code);
+          const nameCell = document.createElement('td');
+          nameCell.textContent =
+            model.displayName && model.displayName !== model.id ? model.displayName : '—';
+          tr.append(idCell, nameCell);
+          bodyEl.append(tr);
         }
+        table.append(head, bodyEl);
         modelsBody.innerHTML = '';
-        modelsBody.append(list);
-        modelsCount.textContent = (body.models || []).length + ' available';
+        modelsBody.append(table);
+        modelsCount.textContent = models.length + ' available';
       } catch (e) {
         modelsCount.textContent = String(e.message || e);
       }
@@ -486,25 +434,33 @@ export function renderAdminPage(options = {}) {
 
     const num = (n) => (typeof n === 'number' ? n.toLocaleString() : '0');
 
-    // Each row is label / value; the same helper serves the totals and the
-    // per-model table so the two cannot drift apart in formatting.
-    const tokenRows = (totals) => {
-      const rows = [
-        ['Calls', num(totals.calls)],
-        ['Input', num(totals.input_tokens)],
-        ['Output', num(totals.output_tokens)],
-        ['Cache read', num(totals.cache_read_input_tokens)],
-        ['Cache write', num(totals.cache_creation_input_tokens)],
-      ];
-      const dl = document.createElement('dl');
-      for (const [label, value] of rows) {
-        const dt = document.createElement('dt');
-        dt.textContent = label;
-        const dd = document.createElement('dd');
-        dd.textContent = value;
-        dl.append(dt, dd);
+    /** Build a table with a header row and rows of strings. */
+    const makeTable = (headers, rows, numericFrom) => {
+      const table = document.createElement('table');
+      table.className = 'grid';
+      const head = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      headers.forEach((label, index) => {
+        const th = document.createElement('th');
+        th.textContent = label;
+        if (index >= numericFrom) th.className = 'num';
+        headRow.append(th);
+      });
+      head.append(headRow);
+      const body = document.createElement('tbody');
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        row.forEach((value, index) => {
+          const td = document.createElement('td');
+          td.textContent = value;
+          if (index >= numericFrom) td.className = 'num';
+          else if (index === 0) td.className = 'name';
+          tr.append(td);
+        });
+        body.append(tr);
       }
-      return dl;
+      table.append(head, body);
+      return table;
     };
 
     const renderTokens = (data) => {
@@ -512,13 +468,26 @@ export function renderAdminPage(options = {}) {
       const totals = data.totals || {};
       if (!totals.calls) {
         const p = document.createElement('p');
-        p.className = 'hint';
-        p.style.margin = '0';
+        p.className = 'empty';
         p.textContent = 'No relayed calls since this process started.';
         tokensBody.append(p);
         return;
       }
-      tokensBody.append(tokenRows(totals));
+
+      tokensBody.append(
+        makeTable(
+          ['Total', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
+          [[
+            'All models',
+            num(totals.calls),
+            num(totals.input_tokens),
+            num(totals.output_tokens),
+            num(totals.cache_read_input_tokens),
+            num(totals.cache_creation_input_tokens),
+          ]],
+          1,
+        ),
+      );
 
       const models = data.byModel || [];
       if (models.length > 0) {
@@ -526,40 +495,20 @@ export function renderAdminPage(options = {}) {
         h.className = 'subhead';
         h.textContent = 'By model';
         tokensBody.append(h);
-        const table = document.createElement('div');
-        table.className = 'use';
-        // Header row reuses the same grid so columns line up with the totals.
-        for (const [label, value] of [
-          ['Model', ''],
-          ['In / Out', ''],
-          ['Cache r/w', ''],
-        ]) {
-          const a = document.createElement('span');
-          a.className = 'use-label';
-          a.textContent = label;
-          const b = document.createElement('span');
-          b.className = 'hint';
-          b.style.margin = '0';
-          b.textContent = value;
-          const c = document.createElement('span');
-          c.className = 'use-val';
-          c.textContent = value;
-          table.append(a, b, c);
-        }
-        for (const row of models) {
-          const a = document.createElement('span');
-          a.className = 'use-label';
-          a.textContent = row.model;
-          const b = document.createElement('span');
-          b.className = 'hint';
-          b.style.margin = '0';
-          b.textContent = num(row.input_tokens) + ' / ' + num(row.output_tokens);
-          const c = document.createElement('span');
-          c.className = 'use-val';
-          c.textContent = num(row.cache_read_input_tokens) + ' / ' + num(row.cache_creation_input_tokens);
-          table.append(a, b, c);
-        }
-        tokensBody.append(table);
+        tokensBody.append(
+          makeTable(
+            ['Model', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
+            models.map((row) => [
+              row.model,
+              num(row.calls),
+              num(row.input_tokens),
+              num(row.output_tokens),
+              num(row.cache_read_input_tokens),
+              num(row.cache_creation_input_tokens),
+            ]),
+            1,
+          ),
+        );
       }
 
       const recent = data.recent || [];
@@ -568,25 +517,19 @@ export function renderAdminPage(options = {}) {
         h.className = 'subhead';
         h.textContent = 'Recent calls';
         tokensBody.append(h);
-        const list = document.createElement('ul');
-        list.className = 'models';
-        for (const call of recent.slice(0, 10)) {
-          const li = document.createElement('li');
-          const time = document.createElement('code');
-          time.textContent = new Date(call.at).toLocaleTimeString();
-          const model = document.createElement('span');
-          model.className = 'hint';
-          model.style.margin = '0';
-          model.textContent = call.model || '(unknown)';
-          const counts = document.createElement('span');
-          counts.className = 'use-val';
-          counts.textContent =
-            num(call.input_tokens) + ' in / ' + num(call.output_tokens) + ' out' +
-            (call.durationMs === null ? '' : ' · ' + (call.durationMs / 1000).toFixed(1) + 's');
-          li.append(time, model, counts);
-          list.append(li);
-        }
-        tokensBody.append(list);
+        tokensBody.append(
+          makeTable(
+            ['Time', 'Model', 'Input', 'Output', 'Duration'],
+            recent.slice(0, 10).map((call) => [
+              new Date(call.at).toLocaleTimeString(),
+              call.model || '(unknown)',
+              num(call.input_tokens),
+              num(call.output_tokens),
+              call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's',
+            ]),
+            2,
+          ),
+        );
       }
     };
 
