@@ -1,3 +1,20 @@
-node_modules/
+# Installed dependencies. The plugin resolves them from the profile, and the
+# server installs its own; neither belongs in the repository. Note the bare
+# `node_modules` form: the plugin's is a symlink here, and a trailing slash only
+# matches directories, so the symlink would otherwise be committed.
+node_modules
 *.tgz
 .DS_Store
+
+# Local secrets. `claude-server/.gitignore` covers its own env files; these
+# entries catch anything created at the root by accident.
+.env
+.env.local
+.env.server
+*.pem
+
+# Development-process notes: these record one operator's environment (private
+# Docker subnets, gateway addresses, measured account data, instruction logs) and
+# are not part of the published project. The READMEs carry what a user needs.
+CONSTRAINTS.md
+PLAN-claude-server.md

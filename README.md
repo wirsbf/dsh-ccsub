@@ -6,6 +6,21 @@ browser OAuth flow. Ships a settings card with the subscription's rate-limit
 windows and an **egress guard** that makes a proxy mandatory for every request
 the route makes.
 
+## Repository layout
+
+The project ships in two halves that can be used together or separately.
+
+| Path | What it is | How to run it |
+|---|---|---|
+| repository root | **The DSH plugin.** `lib/` is the host module and the browser card, `cordis.patch.yml` is its bundle patch. | Install into a DSH profile |
+| [`claude-server/`](claude-server/) | **The standalone server.** Owns the Claude grant and relays requests, so several machines can share one subscription without any of them holding the token. | Node ≥22 directly, or the included Dockerfile / compose file |
+| `lib/tunnel.js` | The client half of server mode: rewrites Anthropic hosts onto the server origin and attaches a client bearer. | Part of the plugin |
+
+The two are independent: the plugin works alone in `direct` mode, and
+`claude-server` is useful on its own for any client that can present a bearer.
+Running the plugin against a server is what `claude-server` mode configures;
+see [Two deployment modes](#two-deployment-modes).
+
 ## What it does
 
 | Capability | How |
@@ -119,9 +134,33 @@ rewrite. `guardTokenEndpoint()` patches the global **once**, redirecting only
 process — including other plugins' — through untouched, and restores it on
 disposal.
 
+## Two deployment modes
+
+| | `direct` (default) | `claude-server` |
+|---|---|---|
+| Grant lives here | ✓ | ✗ — the server holds it |
+| Refreshes the token | ✓ | ✗ — the server is the only refresher |
+| Talks to Anthropic | ✓ through the mandatory proxy | ✗ — only to the server |
+| Credential this process holds | the subscription token | a client bearer the server minted |
+| Proxy block | required | unused |
+| Quota probe | local | served by the server |
+
+`claude-server` mode exists so one machine can own the subscription while other
+machines use it. The token never leaves the server, which matters because
+Anthropic rotates the refresh token on every refresh — two refreshers would
+invalidate each other. The transport is `lib/tunnel.js`; it rewrites the
+Anthropic hosts onto the server origin and attaches the bearer.
+
+See [`claude-server/`](claude-server/) for that service: it ships as a
+standalone Node program with a Dockerfile and a compose file.
+
 ## Configuration
 
 ```yaml
+mode: direct                     # or: claude-server
+claudeServer:                    # used only when mode is claude-server
+  url: 'http://127.0.0.1:4710'   # the server origin
+  bearerRecord: 'claude-server'  # credential record holding the bearer
 proxy:
   url: 'http://127.0.0.1:9077'   # the Claude-specific proxy; mandatory in practice
   egressAllow: []                # empty disables the comparison, not the proxy
@@ -131,6 +170,10 @@ claudeCliVersion: '2.1.283'
 refreshSkewMs: 300000
 quotaPollMs: 180000
 ```
+
+The bearer is stored as an `api-key` record through the harness credential
+plane, not in this configuration file: a bearer in plain text would be copied
+into every settings export.
 
 ## Install
 
@@ -169,6 +212,7 @@ cp -r package.json cordis.patch.yml icon.svg README.md lib locale /tmp/ccsub-pac
 | `POST /plugins/dsh-ccsub/login/answer` | Answer the flow's question |
 | `POST /plugins/dsh-ccsub/login/cancel` | Cancel an in-flight sign-in |
 | `POST /plugins/dsh-ccsub/logout` | Delete the stored grant |
+| `POST /plugins/dsh-ccsub/server/bearer` | Store or clear the claude-server client bearer |
 
 ## Layout
 
@@ -177,12 +221,17 @@ lib/
   index.js          Host plugin: route registration + HTTP surface
   adapter.js        The claude-sub LlmAdapter (PiAiAdapter + guarded transport)
   egress.js         Mandatory-proxy guard, allowlist, UA rewrite
+  tunnel.js         claude-server transport: host rewrite + bearer
   auth/
     store.js        ctx.credentials-backed CredentialStore + AuthContext
     claude.js       Sign-in, refresh-under-lock, usage parsing
     flow.js         ctx.authorization flow (pi-ai events → seam vocabulary)
     bridge.js       Host-side sign-in conversation for the settings card
   client/index.js   Browser settings card
+
+claude-server/      The separate subscription server (see its own README)
+  src/              identity, grant, oauth, auth, sanitize, transport, relay
+  test/             28 offline checks; no network
 ```
 
 ## Credits

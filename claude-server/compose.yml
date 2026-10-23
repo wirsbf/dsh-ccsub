@@ -1,0 +1,92 @@
+# claude-server compose
+#
+# Two deployment shapes, selected by the environment file rather than by editing
+# this file:
+#
+#   .env.local     mode=proxy   — runs on a machine that has no direct route and
+#                                 must egress through claude-gate
+#   .env.server    mode=direct  — runs on a server whose own address is the
+#                                 fixed egress IP worth presenting
+#
+# Start with:  docker compose --env-file .env.local up -d --build
+#
+# The port is published to loopback only. Reaching it from another machine is a
+# deliberate tunnel decision (SSH forward or WireGuard), never a bare mapping,
+# because the bearer in front of it is the only thing standing between the
+# network and the subscription's quota.
+
+services:
+  claude-server:
+    build: .
+    image: claude-server:0.1.0
+    container_name: claude-server
+    restart: unless-stopped
+
+    environment:
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "4710"
+
+      # proxy = mandatory egress proxy; direct = plain connection.
+      UPSTREAM_MODE: ${UPSTREAM_MODE:-proxy}
+      PROXY_URL: ${PROXY_URL:-http://claude-gate:9077}
+
+      # The bearer local DSH clients present. Required; the server refuses to
+      # start without it. Generate with: openssl rand -base64 36
+      CLIENT_BEARER: ${CLIENT_BEARER:?set CLIENT_BEARER in the env file}
+
+      GRANT_PATH: /data/grant.json
+      CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.303}
+      # Pinned so the claimed runtime cannot drift with the image.
+      STAINLESS_RUNTIME_VERSION: ${STAINLESS_RUNTIME_VERSION:-v22.19.0}
+      REFRESH_SKEW_MS: "300000"
+      SANITIZE_BODY: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+    volumes:
+      # The only writable path in the container: it holds the grant.
+      - claude-grant:/data
+
+    ports:
+      - "127.0.0.1:4710:4710"
+
+    networks:
+      - proxy-egress
+
+    # The grant is the only state, and it is a single small file; anything else
+    # writing to the filesystem is a compromise worth failing on.
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4710/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    # A 1 GB host serving streamed responses dies by OOM before it dies by load.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  claude-grant:
+
+# `claude-stealth` carries `claude-gate` (the mihomo proxy) and is only needed in
+# proxy mode. It is declared external because the proxy container owns it; this
+# compose file must never create or modify it. In direct mode nothing on the
+# upstream path uses it, but the network is still attached so one file serves
+# both shapes — remove this block if the server target has no such network.
+networks:
+  proxy-egress:
+    external: true
+    name: ${PROXY_NETWORK:-claude-stealth}
