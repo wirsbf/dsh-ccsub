@@ -89,13 +89,16 @@ describe('cacheShape', () => {
 
 describe('UsageLedger cache verdicts', () => {
   /** Record one call with the given token counts under one identity. */
-  function call(ledger, identity, { input = 0, read = 0, write = 0 }) {
+  function call(ledger, identity, { input = 0, read = 0, write = 0, session = 'one' }) {
     ledger.record({
       input_tokens: input,
       output_tokens: 10,
       cache_read_input_tokens: read,
       cache_creation_input_tokens: write,
       cacheIdentity: identity,
+      // A verdict is decided per conversation; a call with no session can only
+      // ever be a first sighting.
+      sessionKey: session,
       shape: { toolsCount: 1, systemBytes: 10, messagesCount: 1 },
     });
     return ledger.recent[0];
@@ -165,8 +168,8 @@ describe('UsageLedger cache verdicts', () => {
 
   it('keeps each identity separate, so a subagent is not blamed for a main miss', () => {
     const ledger = new UsageLedger();
-    call(ledger, 'parent:system', { input: 8, read: 40000 });
-    call(ledger, 'child:system', { input: 8, write: 12000 });
+    call(ledger, 'parent:system', { input: 8, read: 40000, session: 'parent' });
+    call(ledger, 'child:system', { input: 8, write: 12000, session: 'child' });
     const child = ledger.byCacheIdentity.get('child:system');
     const parent = ledger.byCacheIdentity.get('parent:system');
     assert.equal(child.first, 1);
@@ -210,5 +213,68 @@ describe('UsageLedger cache verdicts', () => {
     ledger.reset();
     assert.equal(ledger.byCacheIdentity.size, 0);
     assert.equal(ledger.recent.length, 0);
+  });
+});
+
+describe('cache verdicts are per conversation, not per prompt shape', () => {
+  /** Record one call under an identity and a session. */
+  function call(ledger, identity, session, { input = 0, read = 0, write = 0 }) {
+    ledger.record({
+      input_tokens: input,
+      output_tokens: 5,
+      cache_read_input_tokens: read,
+      cache_creation_input_tokens: write,
+      cacheIdentity: identity,
+      sessionKey: session,
+      shape: { toolsCount: 0, systemBytes: 100, messagesCount: 2 },
+    });
+    return ledger.recent[0];
+  }
+
+  it('does not call a second conversation a rewrite of the first', () => {
+    // The bug this pins: two conversations sharing a system prompt were judged
+    // against each other's high-water mark, so the smaller one was reported as
+    // "reused + write" — a wasted cache write that never happened. In production
+    // this inflated the waste count enough to send the investigation after the
+    // wrong subsystem.
+    const ledger = new UsageLedger();
+    call(ledger, 'reviewer:policy', 'review-a', { input: 8, write: 50_000 });
+    const second = call(ledger, 'reviewer:policy', 'review-b', { input: 8, write: 12_000 });
+    assert.equal(second.cacheVerdict, 'first', 'a different conversation has its own first call');
+    assert.equal(ledger.byCacheIdentity.get('reviewer:policy').wastedWrites, 0);
+  });
+
+  it('still calls a real rewrite inside one conversation a rewrite', () => {
+    // The distinction must not weaken the real signal.
+    const ledger = new UsageLedger();
+    call(ledger, 'id', 'one', { input: 8, write: 50_000 });
+    // The prompt must fit inside the cached prefix for this to be "reused": 8 +
+    // 2000 read + 500 written = 2508, well under 50000, yet it still wrote.
+    const rewritten = call(ledger, 'id', 'one', { input: 8, read: 2_000, write: 500 });
+    assert.equal(rewritten.cacheVerdict, 'reused');
+    assert.equal(ledger.byCacheIdentity.get('id').wastedWrites, 1);
+  });
+
+  it('counts each conversation once in the identity aggregate', () => {
+    const ledger = new UsageLedger();
+    call(ledger, 'id', 'a', { input: 8, write: 10_000 });
+    call(ledger, 'id', 'b', { input: 8, write: 20_000 });
+    call(ledger, 'id', 'a', { input: 8, read: 10_000, write: 200 });
+    const bucket = ledger.byCacheIdentity.get('id');
+    assert.equal(bucket.calls, 3);
+    assert.equal(bucket.first, 2, 'each conversation contributed one first call');
+    assert.equal(bucket.wastedWrites, 0);
+    // The aggregate high-water is the largest single conversation's *cached*
+    // size. Session `b` wrote 20000 and never grew past it. Input tokens are
+    // beyond the last breakpoint, so they do not count toward the cache.
+    assert.equal(bucket.highWater, 20_000);
+  });
+
+  it('treats a call with no session key as a first sighting every time', () => {
+    // Better to under-report than to invent a history that does not exist.
+    const ledger = new UsageLedger();
+    call(ledger, 'id', undefined, { input: 8, write: 50_000 });
+    const second = call(ledger, 'id', undefined, { input: 8, read: 2_000, write: 50_000 });
+    assert.equal(second.cacheVerdict, 'first');
   });
 });

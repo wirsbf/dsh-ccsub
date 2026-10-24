@@ -259,6 +259,17 @@ export class UsageLedger {
      * all back, so a read below it is a miss that needs explaining.
      */
     this.byCacheIdentity = new Map();
+    /**
+     * Per-session cache history, keyed by the conversation fingerprint.
+     *
+     * A `(tools, system)` pair is not a conversation: two chats, a reviewer
+     * running distinct reviews, and a title generator can all share one. Judging
+     * each against the pair's pooled high-water mark made every shorter prompt
+     * look like a shrink and every different one look like a rewrite, which
+     * inflated the waste figure and pointed at the wrong subsystem. The verdict
+     * is therefore decided per session; the identity bucket only aggregates.
+     */
+    this.bySession = new Map();
   }
 
   /**
@@ -281,10 +292,21 @@ export class UsageLedger {
    * @param writeTokens - of that, how much was written to cache.
    * @returns {{verdict: string, identity?: string, previousHigh?: number, reuseRatio?: number}}
    */
-  classifyCache(identity, promptTokens, readTokens, writeTokens) {
+  classifyCache(identity, sessionKey, promptTokens, readTokens, writeTokens) {
     if (identity === undefined) return { verdict: 'unknown' };
-    const state = this.byCacheIdentity.get(identity);
-    const previousHigh = state?.highWater ?? 0;
+    const bucket = this.byCacheIdentity.get(identity) ?? {
+      calls: 0,
+      first: 0,
+      extended: 0,
+      reused: 0,
+      rewritten: 0,
+      wastedWrites: 0,
+      highWater: 0,
+    };
+    // The bar this call is measured against is its own conversation's, because
+    // only that conversation's earlier prompt is actually in the cache.
+    const session = sessionKey === undefined ? undefined : this.bySession.get(sessionKey);
+    const previousHigh = session?.highWater ?? 0;
     // Share of the prompt that came back from cache. Only meaningful once
     // something was cached, which is why `first` reports none.
     const reuseRatio = promptTokens > 0 ? readTokens / promptTokens : undefined;
@@ -300,7 +322,7 @@ export class UsageLedger {
     const wasted = writeTokens > growth + WASTE_MARGIN;
 
     let verdict;
-    if (state === undefined) verdict = 'first';
+    if (session === undefined) verdict = 'first';
     else if (promptTokens <= previousHigh) verdict = 'reused';
     else verdict = wasted ? 'rewritten' : 'extended';
 
@@ -313,20 +335,18 @@ export class UsageLedger {
     // cached prefix, and letting the bar drift down would turn every later call
     // into an "extension" and make misses invisible.
     const nextHigh = Math.max(previousHigh, cachedAfter);
-    const bucket = state ?? {
-      calls: 0,
-      first: 0,
-      extended: 0,
-      reused: 0,
-      rewritten: 0,
-      wastedWrites: 0,
-      highWater: 0,
-    };
+    // Advance this conversation's own bar, and keep the identity bucket as a
+    // pure aggregate: `highWater` there is the largest single session's, which
+    // is what "how big does this prefix get" asks.
+    if (sessionKey !== undefined) {
+      this.bySession.set(sessionKey, { highWater: nextHigh });
+    }
     bucket.calls += 1;
     bucket[verdict] += 1;
     // The number that matters: a write that bought little or no new prefix.
     if ((verdict === 'reused' || verdict === 'rewritten') && writeTokens > 0) bucket.wastedWrites += 1;
-    bucket.highWater = nextHigh;
+    bucket.highWater = Math.max(bucket.highWater, nextHigh);
+    bucket.sessions = this.bySession.size;
     this.byCacheIdentity.set(identity, bucket);
 
     return { verdict, identity, previousHigh, reuseRatio };
@@ -392,7 +412,13 @@ export class UsageLedger {
     const readTokens = entry.cache_read_input_tokens ?? 0;
     const writeTokens = entry.cache_creation_input_tokens ?? 0;
     const promptTokens = inputTokens + readTokens + writeTokens;
-    const cache = this.classifyCache(identity, promptTokens, readTokens, writeTokens);
+    const cache = this.classifyCache(
+      identity,
+      entry.sessionKey,
+      promptTokens,
+      readTokens,
+      writeTokens,
+    );
 
     this.recent.unshift({
       at: Date.now(),

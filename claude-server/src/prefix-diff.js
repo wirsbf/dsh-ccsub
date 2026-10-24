@@ -82,10 +82,30 @@ export function prefixPieces(body) {
     pieces.push({
       label: `messages[${index}:${message?.role ?? '?'}]`,
       hash: hashOf(message),
-      text: typeof message?.content === 'string' ? message.content : '',
+      // Content is either a string or a list of blocks; reading only the string
+      // form reported every array-content message as zero characters, which made
+      // the reported prefix size wildly understate the truth.
+      text: textOfContent(message?.content),
     });
   });
   return pieces;
+}
+
+/** Flatten either content shape into the text a reader can recognise. */
+function textOfContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((block) => {
+      if (typeof block === 'string') return block;
+      if (block === null || typeof block !== 'object') return '';
+      if (typeof block.text === 'string') return block.text;
+      // Tool results and images carry no `text`; name the block so a reader can
+      // still tell what it was.
+      return block.type === undefined ? '' : `<${block.type}>`;
+    })
+    .filter((part) => part !== '')
+    .join('\n');
 }
 
 /** Quote a piece's text for a log line, bounded and whitespace-collapsed. */

@@ -1685,6 +1685,10 @@ async function relay(req, res, ctx) {
         // still exists; the ledger only aggregates.
         cacheIdentity,
         shape,
+        // The conversation this call belongs to. Without it the ledger cannot
+        // tell two chats sharing a prompt apart, and each one's turn looks like
+        // the other's rewrite.
+        sessionKey: fingerprint,
       });
 
       // Report a prefix mismatch only when it actually cost a cache write.
