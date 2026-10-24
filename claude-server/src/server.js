@@ -51,6 +51,7 @@ import { ClientAuth } from './auth.js';
 import { THINKING_BETAS, ensureBaseBetas, wantsThinkingBetas, withClaudeIdentity } from './identity.js';
 import { LoginSessions } from './login.js';
 import { SessionBindings, fingerprintOf } from './sessions.js';
+import { PrefixTracker, prefixPieces } from './prefix-diff.js';
 import { cacheIdentityOf, cacheShape } from './shape.js';
 import { exchangeCode, parseAuthorizationInput, refreshGrant } from './oauth.js';
 import { sanitizeBody } from './sanitize.js';
@@ -165,6 +166,17 @@ export function createServer(options) {
   // Token accounting for relayed model traffic. Process memory only: see
   // src/usage.js for why it is not persisted.
   const usageLedger = new UsageLedger();
+  /**
+   * Remembers each prefix's pieces, so a mismatch can name the piece that moved.
+   *
+   * `cacheDiagnostics` turns the comparison on: it costs a digest per tool, per
+   * system block, and per message on every request, which is cheap but not free
+   * on a 200k-token prompt. Off unless asked for, so a normal deployment pays
+   * nothing; an investigation sets `CACHE_DIAGNOSTICS=1` and gets a log line
+   * naming the first piece that changed.
+   */
+  const cacheDiagnostics = config.cacheDiagnostics === true;
+  const prefixTracker = cacheDiagnostics ? new PrefixTracker() : undefined;
   /**
    * Which conversation runs on which subscription.
    *
@@ -829,6 +841,25 @@ export function createServer(options) {
       return;
     }
 
+    // --- cache prefix inspection -----------------------------------------------
+    // What each tracked prefix is made of, with a bounded excerpt of every piece.
+    // This exists to answer "which conversation is this, and what in its prompt
+    // keeps changing" without logging prompt text on every request: content is
+    // only handed out here, only to a signed-in operator, and only when the
+    // diagnostics switch is on.
+    if (pathname === `${ADMIN_PREFIX}/api/prefixes` && req.method === 'GET') {
+      if (!signedIn) {
+        sendJson(res, 401, { error: 'this endpoint needs the console session', code: 'UNAUTHORIZED' });
+        return;
+      }
+      if (prefixTracker === undefined) {
+        sendJson(res, 200, { ok: true, enabled: false, prefixes: [] });
+        return;
+      }
+      sendJson(res, 200, { ok: true, enabled: true, ...prefixTracker.snapshot() });
+      return;
+    }
+
     // --- users -----------------------------------------------------------------
     if (pathname === `${ADMIN_PREFIX}/api/users` && req.method === 'GET') {
       await api(async () => {
@@ -1239,6 +1270,9 @@ export function createServer(options) {
         chooseAccount,
         markExhausted,
         exhaustedUntilOf,
+        // Owned by this closure; the relay only reads them.
+        cacheDiagnostics,
+        prefixTracker,
         // Needed to validate a client-named account; undefined on a
         // single-grant deployment, where the header can only name the default.
         accounts,
@@ -1356,6 +1390,10 @@ async function relay(req, res, ctx) {
     markExhausted,
     exhaustedUntilOf,
     accounts,
+    // Cache diagnostics, passed in rather than closed over: `relay` is a
+    // module-level function and cannot see `createServer`'s locals.
+    cacheDiagnostics,
+    prefixTracker,
   } = ctx;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const target = upstreamFor(url.pathname, url.search, ctx.hosts ?? {});
@@ -1412,6 +1450,19 @@ async function relay(req, res, ctx) {
   // digest of the same text on both sides is what makes two turns comparable.
   const shape = cacheShape(parsedBody);
   const cacheIdentity = cacheIdentityOf(shape);
+  // Which piece of the prefix stopped matching, when the previous request under
+  // this identity is still remembered. Computed here because the body is only
+  // available in this scope; reported in the `finally` below, next to the token
+  // counts that decide whether the mismatch actually cost anything.
+  let prefixChange;
+  if (cacheDiagnostics && parsedBody !== null && typeof parsedBody === 'object') {
+    try {
+      prefixChange = prefixTracker.compare(cacheIdentity, prefixPieces(parsedBody));
+    } catch (error) {
+      // A diagnostic must never fail a request.
+      logger.debug('prefix comparison failed: %s', String(error?.message ?? error));
+    }
+  }
   let serving = accountId;
   let switchedFrom;
 
@@ -1635,6 +1686,27 @@ async function relay(req, res, ctx) {
         cacheIdentity,
         shape,
       });
+
+      // Report a prefix mismatch only when it actually cost a cache write.
+      // Every turn legitimately grows the prompt, so a mismatch alone is not
+      // news; a mismatch *plus* a write means the earlier prefix was cached and
+      // was paid for again, which is the thing worth a log line.
+      const wrote = (accounting.cache_creation_input_tokens ?? 0) > 0;
+      if (wrote && prefixChange !== undefined) {
+        logger.info(
+          'cache prefix %s at %s (%s pieces shared)%s%s',
+          prefixChange.kind,
+          prefixChange.label,
+          prefixChange.sharedPrefixes,
+          prefixChange.kind === 'changed' ? ` | was: ${prefixChange.before}` : ' | dropped',
+          prefixChange.kind === 'changed' ? ` | now: ${prefixChange.after}` : '',
+        );
+      } else if (wrote && cacheDiagnostics && prefixChange === undefined && cacheIdentity !== undefined) {
+        // No earlier request under this identity: a first write is expected, and
+        // saying so keeps the log honest about which writes were not explained
+        // by a prefix change.
+        logger.debug('cache prefix first seen for %s', cacheIdentity);
+      }
     }
   }
 }

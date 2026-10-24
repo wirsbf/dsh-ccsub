@@ -258,3 +258,74 @@ test('the usage API exposes the cache fields the console reads', async () => {
     await upstream.close();
   }
 });
+
+test('with diagnostics on, a rewritten prefix names the piece that moved', async () => {
+  // The end this instrumentation exists for: not "the hash differs" but "the
+  // system block at index 0 said X and now says Y". Driven over real HTTP so a
+  // missed wire-up (the relay is a module-level function and cannot close over
+  // the tracker) fails here rather than in production.
+  const upstream = await startUpstream();
+  const dir = await mkdtemp(join(tmpdir(), 'claude-server-prefix-'));
+  const grants = new GrantStore({ path: join(dir, 'grant.json'), refreshSkewMs: 1000, logger: quietLogger });
+  await grants.write({ type: 'oauth', access: REAL_TOKEN, refresh: 'r', expires: Date.now() + 3_600_000 });
+  const lines = [];
+  const transport = new Transport({ mode: 'direct' });
+  const built = createServer({
+    config: {
+      listenHost: '127.0.0.1', listenPort: 0, mode: 'direct',
+      grantPath: join(dir, 'grant.json'), clientBearer: CLIENT_BEARER,
+      claudeCliVersion: '2.1.303', stainlessRuntimeVersion: 'v22.19.0',
+      refreshSkewMs: 1000, loginTtlMs: 60_000, sanitizeBody: false, logLevel: 'debug',
+      maxBodyBytes: 1024 * 1024,
+      cacheDiagnostics: true,
+    },
+    transport, grants,
+    logger: { error() {}, warn() {}, info: (...args) => lines.push(args.join(' ')), debug() {} },
+    hosts: { apiHost: upstream.origin, platformHost: upstream.origin },
+  });
+  await new Promise((resolve) => built.server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${built.server.address().port}`;
+  try {
+    // The same identity must be used across both calls, so the messages are what
+    // differ — a system prompt change would be a different identity and thus a
+    // first sighting, not a mismatch.
+    const first = { model: 'claude-sonnet-5-5', max_tokens: 8, system: [{ type: 'text', text: 'you are helpful' }],
+      tools: [{ name: 'bash' }], messages: [{ role: 'user', content: 'hi' }] };
+    const second = { ...first, messages: [{ role: 'user', content: 'REWRITTEN' }] };
+
+    await post(origin, first, { input_tokens: 8, cache_creation_input_tokens: 15_000 });
+    await post(origin, second, { input_tokens: 8, cache_creation_input_tokens: 15_000 });
+
+    const report = lines.find((line) => line.includes('cache prefix'));
+    assert.ok(report, 'a mismatch that cost a write must be reported');
+    assert.match(report, /changed/);
+    assert.match(report, /messages\[0:user\]/);
+    assert.match(report, /hi/);
+    assert.match(report, /REWRITTEN/);
+  } finally {
+    await built.dispose();
+    await transport.dispose();
+    await rm(dir, { recursive: true, force: true });
+    await upstream.close();
+  }
+});
+
+test('with diagnostics off, nothing is tracked and nothing is logged', async () => {
+  // A deployment that is not investigating must pay neither the digest cost nor
+  // the log noise.
+  const upstream = await startUpstream();
+  const server = await startServer(upstream.origin);
+  try {
+    await post(server.origin, requestBody(), { input_tokens: 8, cache_creation_input_tokens: 15_000 });
+    await post(server.origin, requestBody({ system: 'changed' }), {
+      input_tokens: 8, cache_creation_input_tokens: 15_000,
+    });
+    const snapshot = server.usage.snapshot();
+    // Accounting still works; only the per-piece diff is absent.
+    assert.equal(snapshot.recent.length, 2);
+    assert.equal(snapshot.recent[0].cacheVerdict, 'first');
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});

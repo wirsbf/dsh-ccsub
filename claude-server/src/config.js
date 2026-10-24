@@ -99,6 +99,11 @@ export function loadConfig(env = process.env) {
     // Bounds how long an unauthenticated login attempt may stay pending.
     loginTtlMs: int(env.LOGIN_TTL_MS, 10 * 60 * 1000),
     sanitizeBody: bool(env.SANITIZE_BODY, true),
+    // Names the piece of a prompt that stopped matching, at the cost of a digest
+    // per tool, system block, and message on every request. Off by default: it
+    // answers a specific question ("why did this prefix stop matching") and a
+    // deployment that is not asking it should not pay for it.
+    cacheDiagnostics: bool(env.CACHE_DIAGNOSTICS, false),
     logLevel: String(env.LOG_LEVEL ?? 'info').trim() || 'info',
   };
 }
