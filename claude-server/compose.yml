@@ -12,7 +12,7 @@
 #
 # The port is published to loopback only. Reaching it from another machine is a
 # deliberate tunnel decision (SSH forward or WireGuard), never a bare mapping,
-# because the bearer in front of it is the only thing standing between the
+# because the tokens in front of it are the only thing standing between the
 # network and the subscription's quota.
 
 services:
@@ -30,11 +30,19 @@ services:
       UPSTREAM_MODE: ${UPSTREAM_MODE:-proxy}
       PROXY_URL: ${PROXY_URL:-http://claude-gate:9077}
 
-      # The bearer local DSH clients present. Required; the server refuses to
-      # start without it. Generate with: openssl rand -base64 36
+      # The admin bootstrap token. Required; the server refuses to start without
+      # it. Generate with: openssl rand -base64 36
+      #
+      # This is no longer handed to every client: create a user for each client
+      # on the console's Users page and give them that token instead. The legacy
+      # token is what unlocks the console the first time.
       CLIENT_BEARER: ${CLIENT_BEARER:?set CLIENT_BEARER in the env file}
 
       GRANT_PATH: /data/grant.json
+      # The user directory. Defaults to users.json beside GRANT_PATH; set it to
+      # put users on a different volume from the grant. Created on first use, so
+      # an unwritable path breaks user management without breaking the relay.
+      USERS_PATH: ${USERS_PATH:-/data/users.json}
       CLAUDE_CLI_VERSION: ${CLAUDE_CLI_VERSION:-2.1.303}
       # Pinned so the claimed runtime cannot drift with the image.
       STAINLESS_RUNTIME_VERSION: ${STAINLESS_RUNTIME_VERSION:-v22.19.0}
@@ -43,7 +51,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
 
     volumes:
-      # The only writable path in the container: it holds the grant.
+      # The only writable path in the container: it holds the grant and the
+      # user directory.
       - claude-grant:/data
 
     ports:
@@ -52,8 +61,8 @@ services:
     networks:
       - proxy-egress
 
-    # The grant is the only state, and it is a single small file; anything else
-    # writing to the filesystem is a compromise worth failing on.
+    # The grant and the user directory are the only state — two small files;
+    # anything else writing to the filesystem is a compromise worth failing on.
     read_only: true
     tmpfs:
       - /tmp:mode=1777,size=16m

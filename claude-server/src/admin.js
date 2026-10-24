@@ -1,34 +1,38 @@
 /**
- * The operator console: a single page for managing this server's subscription.
+ * The operator console: the pages behind `/admin`.
  *
  * ## Why this is not authenticated by the client bearer
  *
- * `/login/*` can mint or replace the Claude grant. A browser cannot send an
- * `Authorization` header on a top-level navigation, so a bearer-protected page
- * could not be opened at all. The page therefore has its own session: the
- * operator pastes the client bearer **into the form**, the server verifies it
- * once, and hands back an HttpOnly cookie. The bearer never appears in a URL,
- * a redirect, or a log line.
+ * The console can mint access tokens and replace the Claude grant. A browser
+ * cannot send an `Authorization` header on a top-level navigation, so a
+ * bearer-protected page could not be opened at all. The console therefore has
+ * its own session: the operator pastes an admin token **into the form**, the
+ * server verifies it once, and hands back an HttpOnly cookie. The token never
+ * appears in a URL, a redirect, or a log line.
  *
- * ## Why the session is not a capability escalation
+ * ## Why one shell serves five pages
  *
- * A session cookie is worth exactly what the bearer is worth: both let the
- * holder call `/login/*`. The cookie is strictly weaker than the bearer — it is
- * scoped to this server's admin path, dies with the process, and cannot be
- * replayed against the relay. Nothing here reaches the Claude token; the token
- * stays inside the relay process and is never serialised into any response.
+ * These pages share a navigation rail, a type scale, and a set of table and card
+ * primitives. Serving them from one renderer means the chrome cannot drift: a
+ * change to the sidebar is a change to every page. Routing is server-side
+ * because a session lives in a cookie and each page must be refused (or
+ * redirected) before any markup is produced — a client-side router would have to
+ * ship the authenticated shell to an unauthenticated caller and then hide it.
  *
  * ## What it deliberately does not do
  *
- * No token display, no grant download, no "reveal" affordance. The only
- * credential-shaped output is an expiry timestamp, which the relay already
- * reports through `/status`.
+ * No grant display, no grant download, no "reveal" affordance for the Claude
+ * token. The one credential-shaped output is a newly created user token, shown
+ * exactly once because there is no way to show it twice: only its hash is
+ * stored. Every other identity value on these pages is an id, a name, or a
+ * timestamp.
  *
  * @module claude-server/admin
  */
 
 import { randomBytes } from 'node:crypto';
 import { ADMIN_STYLE } from './admin-style.js';
+import { TOKEN_PREFIX } from './users.js';
 
 /** Cookie name for the console session. */
 export const ADMIN_COOKIE = 'claude_server_admin';
@@ -41,6 +45,28 @@ const MAX_SESSIONS = 8;
 
 /** Path prefix owned by the console. */
 export const ADMIN_PREFIX = '/admin';
+
+/** Where an unlocked console lands. */
+export const ADMIN_HOME = `${ADMIN_PREFIX}/overview`;
+
+/**
+ * The five pages, in navigation order.
+ *
+ * One list drives the sidebar, the active marker, and the redirect table, so a
+ * new page cannot be reachable but unlisted (or listed but unserved).
+ */
+export const CONSOLE_PAGES = [
+  { id: 'overview', path: `${ADMIN_PREFIX}/overview`, label: 'Overview' },
+  { id: 'account', path: `${ADMIN_PREFIX}/account`, label: 'Account' },
+  { id: 'users', path: `${ADMIN_PREFIX}/users`, label: 'Users' },
+  { id: 'usage', path: `${ADMIN_PREFIX}/usage`, label: 'Usage' },
+  { id: 'models', path: `${ADMIN_PREFIX}/models`, label: 'Models' },
+];
+
+/** The page id for a path, or undefined. */
+export function pageForPath(pathname) {
+  return CONSOLE_PAGES.find((page) => page.path === pathname)?.id;
+}
 
 /**
  * In-memory console sessions.
@@ -68,10 +94,11 @@ export class AdminSessions {
   }
 
   /**
-   * Mint one session after the caller proved it holds the client bearer.
+   * Mint one session after the caller proved it holds an admin credential.
+   * @param identity - who unlocked, kept only for display on the pages.
    * @returns the opaque session id.
    */
-  create() {
+  create(identity = {}) {
     this.#sweep();
     if (this.#sessions.size >= MAX_SESSIONS) {
       // Evict the oldest rather than refusing: a stale tab must never lock the
@@ -80,7 +107,11 @@ export class AdminSessions {
       if (oldest !== undefined) this.#sessions.delete(oldest[0]);
     }
     const id = randomBytes(24).toString('hex');
-    this.#sessions.set(id, { expiresAt: Date.now() + this.#ttlMs });
+    this.#sessions.set(id, {
+      expiresAt: Date.now() + this.#ttlMs,
+      name: typeof identity.name === 'string' ? identity.name : 'admin',
+      legacy: identity.legacy === true,
+    });
     return id;
   }
 
@@ -93,6 +124,18 @@ export class AdminSessions {
     this.#sweep();
     const session = this.#sessions.get(String(id ?? ''));
     return session !== undefined && session.expiresAt > Date.now();
+  }
+
+  /**
+   * The identity behind a live session, for the sidebar.
+   * @param id - the cookie value.
+   * @returns the display name, or undefined when the session is not live.
+   */
+  identityOf(id) {
+    this.#sweep();
+    const session = this.#sessions.get(String(id ?? ''));
+    if (session === undefined || session.expiresAt <= Date.now()) return undefined;
+    return { name: session.name, legacy: session.legacy };
   }
 
   /** Revoke one session. */
@@ -114,368 +157,750 @@ export function cookieOf(header, name) {
 }
 
 /**
- * Render the console page.
+ * Escape a value for interpolation into markup.
  *
- * One self-contained document: no build step, no external asset, no framework.
- * The bearer input is the only field that can carry a secret, and it is
- * `type=password` with autocomplete disabled so a borrowed browser does not
- * offer to remember it.
- * @param options - values the page needs at render time.
- * @returns the HTML.
+ * Everything in this module is either a constant or a server-computed value, so
+ * this is defence in depth: a future call site that passes an error message or a
+ * user-supplied name cannot turn one into markup by accident.
  */
-export function renderAdminPage(options = {}) {
-  const signedIn = options.signedIn === true;
-  const mode = String(options.mode ?? 'unknown');
-  const expiresAt = typeof options.expiresAt === 'number' ? options.expiresAt : null;
-  const authed = options.authed === true;
-  const notice = options.notice === undefined ? '' : String(options.notice);
-  const error = options.error === undefined ? '' : String(options.error);
+function esc(value) {
+  return String(value).replace(
+    /[&<>"']/g,
+    (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch],
+  );
+}
 
-  // Everything interpolated below is either a server-controlled constant or a
-  // number this server computed. The two message slots are escaped anyway, so a
-  // future call site cannot turn one into markup by accident.
-  const esc = (value) =>
-    String(value).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+/** A timestamp for display, or an em dash. */
+function stamp(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '—';
+  return `${new Date(value).toISOString().replace('T', ' ').replace(/\..*$/, '')} UTC`;
+}
 
-  const expiry = expiresAt === null ? '—' : new Date(expiresAt).toISOString().replace('T', ' ').replace(/\..*$/, ' UTC');
+/** The mark plus product name, used by the shell and the lock page. */
+function brandMarkup(home) {
+  const tag = home === undefined ? 'div' : 'a';
+  const href = home === undefined ? '' : ` href="${home}"`;
+  return `<${tag} class="brand"${href}>
+      <span class="mark" aria-hidden="true"></span>
+      <span>
+        <span class="brand-name">claude-server</span>
+        <span class="brand-sub">operator console</span>
+      </span>
+    </${tag}>`;
+}
 
+/** Single-stroke icons, drawn at 16px, inheriting `currentColor`. */
+const ICONS = {
+  overview:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+  account:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></svg>',
+  users:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.2 6.2 0 0 1 12.4 0"/><path d="M16 5.2a3 3 0 0 1 0 5.6"/><path d="M17.6 14.4A5.6 5.6 0 0 1 21.2 20"/></svg>',
+  usage:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>',
+  models:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 3 7.5 12 12l9-4.5L12 3Z"/><path d="M3 12.5 12 17l9-4.5"/><path d="M3 17.5 12 22l9-4.5"/></svg>',
+  signout:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 8l-4 4 4 4"/><path d="M6 12h9"/></svg>',
+};
+
+/** The five page declarations, plus a title and subtitle for each page head. */
+const PAGE_META = {
+  overview: {
+    title: 'Overview',
+    subtitle: 'The state of the subscription this server holds, at a glance.',
+  },
+  account: {
+    title: 'Account',
+    subtitle: 'Claude sign-in, grant state, and this console session.',
+  },
+  users: {
+    title: 'Users',
+    subtitle: 'Tokens that may call the relay. Each can be revoked on its own.',
+  },
+  usage: {
+    title: 'Usage',
+    subtitle: 'Tokens consumed by relayed traffic since this process started.',
+  },
+  models: {
+    title: 'Models',
+    subtitle: 'The model catalog this subscription can call.',
+  },
+};
+
+/** The sidebar: one shell for every page so the chrome cannot drift. */
+function sidebarMarkup(page, options) {
+  const links = CONSOLE_PAGES.map((entry) => {
+    const active = entry.id === page;
+    return `<a class="nav-link" href="${entry.path}"${active ? ' aria-current="page"' : ''}${
+      active ? '' : ` aria-label="${entry.label}"`
+    }>${ICONS[entry.id]}<span>${entry.label}</span></a>`;
+  }).join('\n      ');
+  const identity = options.identity;
+  const who =
+    identity === undefined
+      ? ''
+      : `<span class="who" title="This console session">${esc(identity.name)}${identity.legacy ? ' · env bearer' : ''}</span>`;
+  return `<aside class="sidebar">
+    ${brandMarkup(ADMIN_HOME)}
+    <nav class="nav" aria-label="Console pages">
+      ${links}
+    </nav>
+    <div class="sidebar-foot">
+      ${who}
+      <button class="ghost small" id="signout" type="button">${ICONS.signout}Sign out of console</button>
+    </div>
+  </aside>`;
+}
+
+/**
+ * The page shell: head, sidebar, content.
+ *
+ * `body` is the already-escaped markup for one page. Interpolating it here keeps
+ * `<head>`, the stylesheet, the sidebar, and the script in exactly one place.
+ * @param options - active page, page body, identity, and the inline script.
+ */
+function shell(page, body, options) {
+  const title = PAGE_META[page].title;
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>claude-server · console</title>
+<title>${esc(title)} · claude-server</title>
 <style>${ADMIN_STYLE}</style>
 </head>
 <body>
-<main>
-  <header class="masthead">
-    <h1><span class="mark" aria-hidden="true"></span>claude-server</h1>
-    <p>Manage the Claude subscription this server holds.</p>
-  </header>
-  ${notice === '' ? '' : `<p class="msg ok">${esc(notice)}</p>`}
-  ${error === '' ? '' : `<p class="msg err">${esc(error)}</p>`}
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="shell">
+  ${sidebarMarkup(page, options)}
+  <div class="workspace">
+    <main class="content" id="main">
+${body}
+    </main>
+  </div>
+</div>
+<script>${CONSOLE_SCRIPT}</script>
+</body>
+</html>`;
+}
 
-  <section class="card">
-    <h2>State</h2>
-    <dl class="facts">
-      <dt>Signed in</dt>
-      <dd><span class="pill ${signedIn ? 'on' : 'off'}">${signedIn ? 'signed in' : 'not signed in'}</span></dd>
-      <dt>Access expires</dt>
-      <dd>${signedIn ? esc(expiry) : '—'}</dd>
-      <dt>Upstream mode</dt>
-      <dd><code>${esc(mode)}</code></dd>
-    </dl>
-  </section>
+/** The page head: title, subtitle, and any page-level actions. */
+function pageHead(page, actions = '') {
+  const meta = PAGE_META[page];
+  return `<div class="page-head">
+      <div>
+        <h1 class="page-title">${esc(meta.title)}</h1>
+        <p class="page-sub">${esc(meta.subtitle)}</p>
+      </div>
+      ${actions === '' ? '' : `<div class="page-actions">${actions}</div>`}
+    </div>`;
+}
 
-  ${
-    authed
-      ? `<section class="card">
-    <h2>Subscription limits<span class="actions"><span class="hint" id="usage-age" style="margin:0"></span><button class="small" id="refresh-usage">Refresh</button></span></h2>
-    <div id="usage-body"><p class="empty">Loading…</p></div>
-  </section>
+/** A card with a header row and a body. */
+function card(title, body, options = {}) {
+  const actions = options.actions === undefined ? '' : `<div class="actions">${options.actions}</div>`;
+  return `<section class="card">
+      <div class="card-head"><h2>${esc(title)}</h2>${actions}</div>
+      <div class="card-body${options.flush === true ? ' flush' : ''}">${body}</div>
+    </section>`;
+}/** A two-column definition grid. */
+function facts(rows) {
+  return `<dl class="facts">${rows
+    .map(([term, value]) => `<dt>${esc(term)}</dt><dd>${value}</dd>`)
+    .join('')}</dl>`;
+}
 
-  <section class="card">
-    <h2>Models<span class="actions"><span class="hint" id="models-count" style="margin:0"></span><button class="small" id="refresh-models">Refresh</button></span></h2>
-    <div id="models-body"><p class="empty">Loading…</p></div>
-  </section>
+/** A stat tile. `id` is set when client-side code fills the value in. */
+function tile({ label, value, meta, state = '', id }) {
+  return `<div class="tile${state === '' ? '' : ` ${state}`}"${id === undefined ? '' : ` id="${id}"`}>
+        <p class="tile-label">${esc(label)}</p>
+        <p class="tile-value"${id === undefined ? '' : ` data-value`}>${esc(value)}</p>
+        <p class="tile-meta"${id === undefined ? '' : ` data-meta`}>${esc(meta)}</p>
+      </div>`;
+}
 
-  <section class="card">
-    <h2>Token usage<span class="actions"><span class="hint" id="tokens-since" style="margin:0"></span><button class="small" id="refresh-usage-tokens">Refresh</button></span></h2>
-    <div id="tokens-body"><p class="empty">Loading…</p></div>
-    <p class="note">Counted from responses relayed by this process, and reset when it restarts.</p>
-  </section>`
-      : ''
-  }
+/** A status pill. */
+function pill(text, state = 'muted') {
+  return `<span class="pill ${state}">${esc(text)}</span>`;
+}
 
-  ${
-    authed
-      ? `<section class="card">
-    <h2>Sign in to Claude</h2>
-    <p class="note" style="margin:0 0 var(--s-3)">
-      Opens Anthropic's authorize page in a new tab. After you approve, the browser lands on a
-      <code>localhost</code> address that is not served — copy that full address from the bar and paste it below.
-    </p>
-    <div class="row top">
-      <button class="primary" id="start">Start sign-in</button>
-      <button id="cancel" disabled>Cancel pending</button>
-    </div>
-    <div id="stage"></div>
-  </section>
-
-  <section class="card">
-    <h2>Session</h2>
-    <div class="row top">
-      <button class="danger" id="forget">Sign out of console</button>
-    </div>
-    <p class="note">Ends this browser session only. The Claude grant stays on the server.</p>
-  </section>`
-      : `<section>
-    <h2>Unlock</h2>
-    <p class="note" style="margin:0 0 var(--s-3)">
-      Paste this server's <code>CLIENT_BEARER</code>. It is verified once and exchanged for an
-      <code>HttpOnly</code> session cookie; it is never stored in the page or echoed back.
-    </p>
-    <div class="field">
-      <label for="bearer">Client bearer</label>
-      <input id="bearer" type="password" autocomplete="off" spellcheck="false" placeholder="at least 24 characters">
-    </div>
-    <div class="row">
-      <button class="primary" id="unlock">Unlock</button>
-    </div>
-  </section>`
-  }
-</main>
+/**
+ * The lock page.
+ *
+ * The first thing an operator sees, so it is a single focused card rather than a
+ * form among cards. The only input that can carry a secret is `type=password`
+ * with autocomplete disabled, so a borrowed browser does not offer to remember
+ * it.
+ * @param options - signed-in state and mode, for the status line.
+ * @returns the HTML.
+ */
+export function renderLockPage(options = {}) {
+  const signedIn = options.signedIn === true;
+  const mode = String(options.mode ?? 'unknown');
+  const notice = options.notice === undefined ? '' : String(options.notice);
+  const error = options.error === undefined ? '' : String(options.error);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Unlock · claude-server</title>
+<style>${ADMIN_STYLE}</style>
+</head>
+<body>
+<div class="lock-shell">
+  <main class="lock">
+    ${brandMarkup(undefined)}
+    <h1>Unlock the console</h1>
+    <p class="lede">Paste an admin token. It is verified once and exchanged for an
+      <code>HttpOnly</code> session cookie; it is never stored in the page or echoed back.</p>
+    ${notice === '' ? '' : `<p class="msg ok">${esc(notice)}</p>`}
+    ${error === '' ? '' : `<p class="msg err">${esc(error)}</p>`}
+    <form id="unlock-form" method="post" action="${ADMIN_PREFIX}/api/session" autocomplete="off">
+      <div class="field">
+        <label for="bearer">Admin token</label>
+        <input id="bearer" name="bearer" type="password" autocomplete="off" spellcheck="false"
+               placeholder="${TOKEN_PREFIX}… or the CLIENT_BEARER" aria-describedby="bearer-hint">
+        <p class="field-hint" id="bearer-hint">The <code>CLIENT_BEARER</code> from the server's environment, or a token issued to an admin.</p>
+      </div>
+      <p class="msg err" id="unlock-error" hidden></p>
+      <div class="row">
+        <button class="primary block" id="unlock" type="submit">Unlock</button>
+      </div>
+    </form>
+    <p class="note" id="lock-state">${
+      signedIn ? 'A Claude grant is stored on this server.' : 'This server is not signed in to Claude yet.'
+    } Mode: <code>${esc(mode)}</code>.</p>
+  </main>
+</div>
 <script>
-(() => {
-  const AUTHD = ${authed ? 'true' : 'false'};
-  const stage = document.getElementById('stage');
-
-  /** POST JSON to an admin endpoint; returns {ok, body}. */
-  const post = async (path, payload) => {
-    const res = await fetch(path, {
+(function () {
+  'use strict';
+  var form = document.getElementById('unlock-form');
+  var input = document.getElementById('bearer');
+  var button = document.getElementById('unlock');
+  var errorBox = document.getElementById('unlock-error');
+  if (!form) return;
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    button.disabled = true;
+    errorBox.hidden = true;
+    fetch('${ADMIN_PREFIX}/api/session', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload ?? {}),
-      credentials: 'same-origin',
+      body: JSON.stringify({ bearer: input.value }),
+      credentials: 'same-origin'
+    }).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (body) {
+        if (response.ok) {
+          window.location.replace('${ADMIN_HOME}');
+          return;
+        }
+        button.disabled = false;
+        errorBox.hidden = false;
+        errorBox.textContent = (body && body.error) || ('HTTP ' + response.status);
+      });
+    }).catch(function (error) {
+      button.disabled = false;
+      errorBox.hidden = false;
+      errorBox.textContent = String(error && error.message ? error.message : error);
     });
-    const body = await res.json().catch(() => null);
-    return { ok: res.ok, status: res.status, body };
+  });
+  input.focus();
+})();
+</script>
+</body>
+</html>`;
+}
+
+// --- page bodies -----------------------------------------------------------
+
+function overviewBody(options) {
+  const { signedIn, expiresAt, mode, cliVersion, users } = options;
+  const enabled = Array.isArray(users) ? users.filter((user) => user.disabled !== true).length : 0;
+  const total = Array.isArray(users) ? users.length : 0;
+  return `${pageHead('overview', `<a class="hint" href="${ADMIN_PREFIX}/account">Manage account</a>`)}
+      <div class="tiles">
+        ${tile({
+          label: 'Claude sign-in',
+          value: signedIn ? 'Signed in' : 'Not signed in',
+          meta: signedIn ? `Access expires ${stamp(expiresAt)}` : 'No grant is stored on this server',
+          state: signedIn ? 'ok' : 'over',
+        })}
+        ${tile({
+          label: 'Quota headroom',
+          value: '—',
+          meta: 'Waiting for the usage probe',
+          state: '',
+          id: 'tile-quota',
+        })}
+        ${tile({
+          label: 'Users',
+          value: String(total),
+          meta: `${enabled} enabled · includes the env bearer`,
+        })}
+        ${tile({
+          label: 'Relayed calls',
+          value: '—',
+          meta: 'Since this process started',
+          id: 'tile-calls',
+        })}
+      </div>
+      ${card(
+        'Subscription limits',
+        '<div id="usage-body" class="windows"><p class="empty">Loading…</p></div>',
+        {
+          actions: `<span class="hint" id="usage-age"></span><button class="small" id="refresh-usage" type="button">Refresh</button>`,
+        },
+      )}
+      ${card(
+        'Recent calls',
+        '<div id="recent-body"><p class="empty">Loading…</p></div>',
+        {
+          actions: `<a class="hint" href="${ADMIN_PREFIX}/usage">All usage</a>`,
+        },
+      )}
+      <p class="note">Upstream mode <code>${esc(mode)}</code> · claimed CLI version <code>${esc(cliVersion)}</code>.</p>`;
+}
+
+function accountBody(options) {
+  const { signedIn, expiresAt, mode, cliVersion, identity } = options;
+  return `${pageHead('account')}
+      ${card(
+        'Claude grant',
+        facts([
+          ['Signed in', signedIn ? pill('signed in', 'on') : pill('not signed in', 'off')],
+          ['Access expires', esc(signedIn ? stamp(expiresAt) : '—')],
+          ['Upstream mode', `<code>${esc(mode)}</code>`],
+          ['Claimed CLI version', `<code>${esc(cliVersion)}</code>`],
+        ]),
+      )}
+      ${card(
+        'Sign in to Claude',
+        `<p class="hint">Opens Anthropic's authorize page in a new tab. After you approve, the
+          browser lands on a <code>localhost</code> address that is not served — copy that full
+          address from the bar and paste it below, or paste the code and state.</p>
+        <div class="row" id="login-actions">
+          <button class="primary" id="start" type="button">Start sign-in</button>
+          <button id="cancel" type="button" disabled>Cancel pending</button>
+        </div>
+        <div id="stage"></div>`,
+      )}
+      ${card(
+        'Console session',
+        facts([
+          ['Unlocked as', esc(identity?.name ?? 'admin')],
+          [
+            'Credential',
+            identity?.legacy === true
+              ? 'The environment bearer (<code>CLIENT_BEARER</code>)'
+              : 'A stored admin user',
+          ],
+        ]),
+        {
+          actions: `<button class="danger small" id="signout-account" type="button">${ICONS.signout}Sign out</button>`,
+        },
+      )}
+      <p class="note">Signing out ends this browser session only. The Claude grant and every user token stay on the server.</p>`;
+}
+
+function usersBody(options) {
+  const users = Array.isArray(options.users) ? options.users : [];
+  const rows = users
+    .map((user) => {
+      const legacy = user.legacy === true;
+      const name = `${esc(user.name)}${legacy ? ` ${pill('env bearer', 'accent')}` : ''}`;
+      const role = `<code>${esc(user.role)}</code>`;
+      const status = user.disabled === true ? pill('disabled', 'off') : pill('enabled', 'on');
+      const actions = legacy
+        ? '<span class="hint">set by the environment</span>'
+        : `<button class="small" type="button" data-action="toggle" data-id="${esc(user.id)}" data-disabled="${
+            user.disabled === true ? 'true' : 'false'
+          }" aria-label="${user.disabled === true ? 'Enable' : 'Disable'} user ${esc(user.name)}">${
+            user.disabled === true ? 'Enable' : 'Disable'
+          }</button><button class="small danger" type="button" data-action="remove" data-id="${esc(
+            user.id,
+          )}" data-name="${esc(user.name)}" aria-label="Remove user ${esc(user.name)}">Remove</button>`;
+      return `<tr data-user-row="${esc(user.id)}">
+          <td class="strong">${name}</td>
+          <td>${role}</td>
+          <td>${status}</td>
+          <td class="when">${esc(stamp(user.createdAt))}</td>
+          <td class="when">${esc(stamp(user.lastUsedAt))}</td>
+          <td class="actions">${actions}</td>
+        </tr>`;
+    })
+    .join('\n        ');
+  return `${pageHead('users')}
+      <div id="reveal-slot"></div>
+      ${card(
+        'Add user',
+        `<p class="hint">A new token is shown once, immediately after it is created. Only a hash is
+          stored, so it cannot be recovered later — issue a new one instead.</p>
+        <form class="form-inline" id="add-user-form" autocomplete="off" style="margin-top:1rem">
+          <div class="field">
+            <label for="user-name">Name</label>
+            <input id="user-name" name="name" type="text" maxlength="64" placeholder="alice" required>
+          </div>
+          <div class="field compact">
+            <label for="user-role">Role</label>
+            <select id="user-role" name="role" aria-describedby="role-hint">
+              <option value="client" selected>client</option>
+              <option value="admin">admin</option>
+            </select>
+          </div>
+          <div class="form-submit">
+            <button class="primary" id="add-user" type="submit">Create token</button>
+          </div>
+        </form>
+        <p class="field-hint" id="role-hint"><code>client</code> may call the relay. <code>admin</code> may also unlock this console and manage users.</p>
+        <p class="msg err" id="users-error" hidden></p>`,
+      )}
+      <section class="card">
+        <div class="card-head"><h2>Users</h2><div class="actions"><span class="hint" id="users-count">${users.length} total</span></div></div>
+        <div class="card-body flush" id="users-table-body">
+          ${
+            users.length === 0
+              ? '<p class="empty" style="padding:1rem">No users yet.</p>'
+              : `<div class="table-wrap"><table class="data" id="users-table">
+            <thead><tr>
+              <th>Name</th><th>Role</th><th>Status</th><th>Created</th><th>Last used</th>
+              <th class="num">Actions</th>
+            </tr></thead>
+            <tbody>
+        ${rows}
+            </tbody>
+          </table></div>`
+          }
+        </div>
+      </section>`;
+}
+
+function usageBody(options) {
+  return `${pageHead('usage')}
+      ${card(
+        'Token accounting',
+        '<div id="tokens-body"><p class="empty">Loading…</p></div>',
+        {
+          actions: `<span class="hint" id="tokens-since"></span><button class="small" id="refresh-usage-tokens" type="button">Refresh</button>`,
+        },
+      )}
+      <p class="note">Counted from responses relayed by this process and reset when it restarts.</p>`;
+}
+
+function modelsBody(options) {
+  return `${pageHead('models')}
+      ${card('Model catalog', '<div id="models-body"><p class="empty">Loading…</p></div>', {
+        actions: `<span class="hint" id="models-count"></span><button class="small" id="refresh-models" type="button">Refresh</button>`,
+      })}`;
+}
+
+/**
+ * Render one console page.
+ *
+ * The page id must be one of `CONSOLE_PAGES`; callers route through
+ * `pageForPath`, so an unknown id is a programming error rather than a runtime
+ * input this function has to render around.
+ * @param options - the page id plus the values that page shows.
+ * @returns the HTML.
+ */
+export function renderConsolePage(options = {}) {
+  const page = options.page;
+  const body =
+    page === 'overview'
+      ? overviewBody(options)
+      : page === 'account'
+        ? accountBody(options)
+        : page === 'users'
+          ? usersBody(options)
+          : page === 'usage'
+            ? usageBody(options)
+            : modelsBody(options);
+  return shell(page, body, options);
+}
+
+// --- client behaviour ------------------------------------------------------
+
+/**
+ * The one inline script every console page loads.
+ *
+ * It is shared rather than per-page for the same reason the shell is: the five
+ * pages use the same helpers, and a copied helper is a helper that drifts. Each
+ * block is guarded by the presence of its root element, so a page pays nothing
+ * for the behaviour it does not have.
+ *
+ * No template literals, no arrow functions required, no DOM building with
+ * `innerHTML` from API data — every value goes through `textContent`.
+ */
+const CONSOLE_SCRIPT = `
+(function () {
+  'use strict';
+
+  var post = function (path, payload) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+      credentials: 'same-origin'
+    }).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (body) {
+        return { ok: response.ok, status: response.status, body: body };
+      });
+    });
   };
 
-  const unlock = document.getElementById('unlock');
-  if (unlock) {
-    const input = document.getElementById('bearer');
-    const go = async () => {
-      unlock.disabled = true;
-      const r = await post('/admin/session', { bearer: input.value });
-      if (r.ok) location.reload();
-      else {
-        unlock.disabled = false;
-        alert((r.body && r.body.error) || ('HTTP ' + r.status));
-      }
-    };
-    unlock.addEventListener('click', () => void go());
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') void go(); });
-    input.focus();
-  }
-
-  const forget = document.getElementById('forget');
-  if (forget) {
-    forget.addEventListener('click', async () => {
-      await post('/admin/logout');
-      location.reload();
+  var send = function (path, method, payload) {
+    return fetch(path, {
+      method: method,
+      headers: { 'content-type': 'application/json' },
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+      credentials: 'same-origin'
+    }).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (body) {
+        return { ok: response.ok, status: response.status, body: body };
+      });
     });
-  }
+  };
 
-  if (AUTHD) {
-    // ---- subscription limits -------------------------------------------------
-    const usageBody = document.getElementById('usage-body');
-    const usageAge = document.getElementById('usage-age');
+  var get = function (path) {
+    return fetch(path, { credentials: 'same-origin' }).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (body) {
+        return { ok: response.ok, status: response.status, body: body };
+      });
+    });
+  };
 
-    // Anthropic reports limits two ways; the structured 'limits' array is the
-    // current shape and the flat five_hour/seven_day buckets are the older one.
-    // Read the array when it carries entries, else fall back, so the panel keeps
-    // working across either response.
-    const windowsOf = (usage) => {
-      const out = [];
-      if (Array.isArray(usage && usage.limits)) {
-        for (const row of usage.limits) {
-          if (!row || typeof row.percent !== 'number') continue;
-          out.push({ label: row.kind || row.group || 'limit', percent: row.percent, resetsAt: row.resets_at || null });
-        }
+  var problem = function (result, what) {
+    if (result.status === 401) {
+      window.location.replace('/admin');
+      return what + ': the console session expired';
+    }
+    return (result.body && result.body.error) || (what + ': HTTP ' + result.status);
+  };
+
+  var num = function (n) {
+    return typeof n === 'number' ? n.toLocaleString() : '0';
+  };
+
+  var table = function (headers, rows, numericFrom) {
+    var node = document.createElement('table');
+    node.className = 'data';
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    headers.forEach(function (label, index) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (index >= numericFrom) th.className = 'num';
+      headRow.append(th);
+    });
+    head.append(headRow);
+    var body = document.createElement('tbody');
+    rows.forEach(function (row) {
+      var tr = document.createElement('tr');
+      row.forEach(function (value, index) {
+        var td = document.createElement('td');
+        td.textContent = value;
+        if (index >= numericFrom) td.className = 'num';
+        else if (index === 0) td.className = 'strong';
+        tr.append(td);
+      });
+      body.append(tr);
+    });
+    node.append(head, body);
+    return node;
+  };
+
+  var showError = function (box, message) {
+    box.hidden = false;
+    box.textContent = message;
+  };
+
+  var signOut = function () {
+    return post('/admin/api/logout').then(function () {
+      window.location.replace('/admin');
+    });
+  };
+
+  var signOutButton = document.getElementById('signout');
+  if (signOutButton) signOutButton.addEventListener('click', function () { void signOut(); });
+  var signOutAccount = document.getElementById('signout-account');
+  if (signOutAccount) signOutAccount.addEventListener('click', function () { void signOut(); });
+
+  // ---- Overview: quota windows, headline tiles ----------------------------
+  var usageBody = document.getElementById('usage-body');
+  var usageAge = document.getElementById('usage-age');
+  var tileQuota = document.getElementById('tile-quota');
+  var tileCalls = document.getElementById('tile-calls');
+  var recentBody = document.getElementById('recent-body');
+
+  var windowsOf = function (usage) {
+    var out = [];
+    if (usage && Array.isArray(usage.limits)) {
+      usage.limits.forEach(function (row) {
+        if (!row || typeof row.percent !== 'number') return;
+        out.push({ label: row.kind || row.group || 'limit', percent: row.percent, resetsAt: row.resets_at || null });
+      });
+    }
+    if (out.length === 0) {
+      [['five_hour', '5-hour'], ['seven_day', 'weekly']].forEach(function (pair) {
+        var row = usage && usage[pair[0]];
+        if (!row || typeof row.utilization !== 'number') return;
+        out.push({ label: pair[1], percent: row.utilization, resetsAt: row.resets_at || null });
+      });
+    }
+    return out;
+  };
+
+  var windowName = function (label) {
+    return String(label).replace(/_/g, ' ').replace(/\\b\\w/g, function (c) { return c.toUpperCase(); });
+  };
+
+  var stateOf = function (pct) {
+    if (pct >= 90) return 'over';
+    if (pct >= 70) return 'warn';
+    return '';
+  };
+
+  var renderUsage = function (usage) {
+    if (!usageBody) return;
+    var rows = windowsOf(usage);
+    usageBody.textContent = '';
+    if (rows.length === 0) {
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'No limit windows reported.';
+      usageBody.append(empty);
+      return;
+    }
+    rows.forEach(function (row) {
+      var box = document.createElement('div');
+      box.className = 'window';
+      var head = document.createElement('div');
+      head.className = 'window-head';
+      var name = document.createElement('span');
+      name.className = 'window-name';
+      name.textContent = windowName(row.label);
+      var figure = document.createElement('span');
+      figure.className = 'window-figure';
+      var pct = Math.max(0, Math.min(100, row.percent));
+      var state = stateOf(pct);
+      if (state === 'over') figure.className = 'window-figure critical';
+      else if (state === 'warn') figure.className = 'window-figure hot';
+      figure.textContent = row.percent.toFixed(0) + '% used';
+      head.append(name, figure);
+      var bar = document.createElement('div');
+      bar.className = 'meter';
+      bar.setAttribute('aria-hidden', 'true');
+      var fill = document.createElement('span');
+      fill.style.width = pct + '%';
+      if (state !== '') fill.className = state;
+      bar.append(fill);
+      box.append(head, bar);
+      if (row.resetsAt) {
+        var reset = document.createElement('p');
+        reset.className = 'window-reset';
+        reset.textContent = 'Resets ' + new Date(row.resetsAt).toLocaleString();
+        box.append(reset);
       }
-      if (out.length === 0) {
-        for (const [key, label] of [['five_hour', '5-hour'], ['seven_day', 'weekly']]) {
-          const row = usage && usage[key];
-          if (!row || typeof row.utilization !== 'number') continue;
-          out.push({ label, percent: row.utilization, resetsAt: row.resets_at || null });
-        }
-      }
-      return out;
-    };
+      usageBody.append(box);
+    });
+  };
 
-    /** Human-readable name for a limit window key. */
-    const windowName = (label) =>
-      String(label).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  var renderQuotaTile = function (usage) {
+    if (!tileQuota) return;
+    var rows = windowsOf(usage);
+    var value = tileQuota.querySelector('[data-value]');
+    var meta = tileQuota.querySelector('[data-meta]');
+    if (rows.length === 0) {
+      value.textContent = '—';
+      meta.textContent = 'No limit windows reported';
+      return;
+    }
+    var peak = rows.slice().sort(function (a, b) { return b.percent - a.percent; })[0];
+    var pct = Math.max(0, Math.min(100, peak.percent));
+    value.textContent = pct.toFixed(0) + '%';
+    meta.textContent = 'Highest window: ' + windowName(peak.label);
+    tileQuota.className = 'tile ' + stateOf(pct);
+  };
 
-    const renderUsage = (usage) => {
-      const rows = windowsOf(usage);
-      if (rows.length === 0) {
-        usageBody.innerHTML = '<p class="empty">No limit windows reported.</p>';
+  var loadUsage = function () {
+    if (!usageBody) return;
+    if (usageAge) usageAge.textContent = 'loading…';
+    get('/admin/api/quota').then(function (result) {
+      if (!result.ok) {
+        usageBody.textContent = '';
+        var p = document.createElement('p');
+        p.className = 'msg err';
+        p.textContent = problem(result, 'Quota');
+        usageBody.append(p);
+        if (usageAge) usageAge.textContent = '';
         return;
       }
-      usageBody.innerHTML = '';
-      for (const row of rows) {
-        const box = document.createElement('div');
-        box.className = 'window';
-
-        const head = document.createElement('div');
-        head.className = 'window-head';
-        const name = document.createElement('span');
-        name.className = 'window-name';
-        name.textContent = windowName(row.label);
-        const figure = document.createElement('span');
-        figure.className = 'window-figure';
-        figure.textContent = row.percent.toFixed(0) + '%';
-        head.append(name, figure);
-
-        const bar = document.createElement('div');
-        bar.className = 'meter';
-        // The meter is decorative; the figure above and the reset line below
-        // carry the same information as text, so this needs no ARIA role.
-        bar.setAttribute('aria-hidden', 'true');
-        const fill = document.createElement('span');
-        const pct = Math.max(0, Math.min(100, row.percent));
-        fill.style.width = pct + '%';
-        if (pct >= 90) fill.className = 'over';
-        else if (pct >= 70) fill.className = 'warn';
-        bar.append(fill);
-
-        box.append(head, bar);
-
-        if (row.resetsAt) {
-          const reset = document.createElement('p');
-          reset.className = 'window-reset';
-          reset.textContent = 'Resets ' + new Date(row.resetsAt).toLocaleString();
-          box.append(reset);
-        }
-        usageBody.append(box);
+      renderUsage(result.body && result.body.usage);
+      renderQuotaTile(result.body && result.body.usage);
+      if (usageAge) {
+        usageAge.textContent = (result.body && result.body.cached ? 'cached ' : 'updated ') +
+          new Date((result.body && result.body.at) || Date.now()).toLocaleTimeString();
       }
-    };
+    }).catch(function (error) {
+      if (usageAge) usageAge.textContent = String(error && error.message ? error.message : error);
+    });
+  };
 
-    const loadUsage = async () => {
-      usageAge.textContent = 'loading…';
-      try {
-        const r = await fetch('/admin/quota', { credentials: 'same-origin' });
-        const body = await r.json().catch(() => null);
-        if (!r.ok) {
-          usageBody.innerHTML = '';
-          const p = document.createElement('p');
-          p.className = 'msg err';
-          p.style.margin = '0';
-          p.textContent = (body && body.error) || ('HTTP ' + r.status);
-          usageBody.append(p);
-          usageAge.textContent = '';
-          return;
-        }
-        renderUsage(body.usage);
-        usageAge.textContent = 'updated ' + new Date().toLocaleTimeString();
-      } catch (e) {
-        usageAge.textContent = String(e.message || e);
+  // ---- Usage page: totals, by model, recent calls -------------------------
+  var tokensBody = document.getElementById('tokens-body');
+  var tokensSince = document.getElementById('tokens-since');
+
+  var renderRecent = function (data) {
+    if (recentBody && data && Array.isArray(data.recent)) {
+      recentBody.textContent = '';
+      if (data.recent.length === 0) {
+        var empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = 'No relayed calls since this process started.';
+        recentBody.append(empty);
+      } else {
+        var wrap = document.createElement('div');
+        wrap.className = 'table-wrap';
+        wrap.append(table(
+          ['Time', 'Model', 'Input', 'Output', 'Duration'],
+          data.recent.slice(0, 6).map(function (call) {
+            return [
+              new Date(call.at).toLocaleTimeString(),
+              call.model || '(unknown)',
+              num(call.input_tokens),
+              num(call.output_tokens),
+              call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's'
+            ];
+          }),
+          2
+        ));
+        recentBody.append(wrap);
       }
-    };
+    }
+    if (tileCalls && data && data.totals) {
+      tileCalls.querySelector('[data-value]').textContent = num(data.totals.calls);
+      tileCalls.querySelector('[data-meta]').textContent = 'Since ' + new Date(data.since).toLocaleString();
+    }
+  };
 
-    // ---- models --------------------------------------------------------------
-    const modelsBody = document.getElementById('models-body');
-    const modelsCount = document.getElementById('models-count');
-
-    const loadModels = async () => {
-      modelsCount.textContent = 'loading…';
-      try {
-        const r = await fetch('/admin/models', { credentials: 'same-origin' });
-        const body = await r.json().catch(() => null);
-        if (!r.ok) {
-          modelsBody.innerHTML = '';
-          const p = document.createElement('p');
-          p.className = 'msg err';
-          p.style.margin = '0';
-          p.textContent = (body && body.error) || ('HTTP ' + r.status);
-          modelsBody.append(p);
-          modelsCount.textContent = '';
-          return;
-        }
-        const models = body.models || [];
-        if (models.length === 0) {
-          modelsBody.innerHTML = '<p class="empty">The endpoint reported no models.</p>';
-          modelsCount.textContent = '';
-          return;
-        }
-        // A table rather than a list: the id and its display name are two
-        // columns of the same fact, and aligning them makes a long catalog
-        // scannable.
-        const table = document.createElement('table');
-        table.className = 'grid';
-        const head = document.createElement('thead');
-        const headRow = document.createElement('tr');
-        for (const label of ['Model id', 'Name']) {
-          const th = document.createElement('th');
-          th.textContent = label;
-          headRow.append(th);
-        }
-        head.append(headRow);
-        const bodyEl = document.createElement('tbody');
-        for (const model of models) {
-          const tr = document.createElement('tr');
-          const idCell = document.createElement('td');
-          idCell.className = 'name';
-          const code = document.createElement('code');
-          code.textContent = model.id;
-          idCell.append(code);
-          const nameCell = document.createElement('td');
-          nameCell.textContent =
-            model.displayName && model.displayName !== model.id ? model.displayName : '—';
-          tr.append(idCell, nameCell);
-          bodyEl.append(tr);
-        }
-        table.append(head, bodyEl);
-        modelsBody.innerHTML = '';
-        modelsBody.append(table);
-        modelsCount.textContent = models.length + ' available';
-      } catch (e) {
-        modelsCount.textContent = String(e.message || e);
-      }
-    };
-
-    // ---- token accounting ----------------------------------------------------
-    const tokensBody = document.getElementById('tokens-body');
-    const tokensSince = document.getElementById('tokens-since');
-
-    const num = (n) => (typeof n === 'number' ? n.toLocaleString() : '0');
-
-    /** Build a table with a header row and rows of strings. */
-    const makeTable = (headers, rows, numericFrom) => {
-      const table = document.createElement('table');
-      table.className = 'grid';
-      const head = document.createElement('thead');
-      const headRow = document.createElement('tr');
-      headers.forEach((label, index) => {
-        const th = document.createElement('th');
-        th.textContent = label;
-        if (index >= numericFrom) th.className = 'num';
-        headRow.append(th);
-      });
-      head.append(headRow);
-      const body = document.createElement('tbody');
-      for (const row of rows) {
-        const tr = document.createElement('tr');
-        row.forEach((value, index) => {
-          const td = document.createElement('td');
-          td.textContent = value;
-          if (index >= numericFrom) td.className = 'num';
-          else if (index === 0) td.className = 'name';
-          tr.append(td);
-        });
-        body.append(tr);
-      }
-      table.append(head, body);
-      return table;
-    };
-
-    const renderTokens = (data) => {
-      tokensBody.innerHTML = '';
-      const totals = data.totals || {};
+  var renderTokens = function (data) {
+    if (tokensBody) {
+      tokensBody.textContent = '';
+      var totals = data.totals || {};
       if (!totals.calls) {
-        const p = document.createElement('p');
+        var p = document.createElement('p');
         p.className = 'empty';
         p.textContent = 'No relayed calls since this process started.';
         tokensBody.append(p);
-        return;
-      }
-
-      tokensBody.append(
-        makeTable(
+      } else {
+        var section = document.createElement('div');
+        section.className = 'table-wrap';
+        section.append(table(
           ['Total', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
           [[
             'All models',
@@ -483,155 +908,490 @@ export function renderAdminPage(options = {}) {
             num(totals.input_tokens),
             num(totals.output_tokens),
             num(totals.cache_read_input_tokens),
-            num(totals.cache_creation_input_tokens),
+            num(totals.cache_creation_input_tokens)
           ]],
-          1,
-        ),
-      );
+          1
+        ));
+        tokensBody.append(section);
 
-      const models = data.byModel || [];
-      if (models.length > 0) {
-        const h = document.createElement('h3');
-        h.className = 'subhead';
-        h.textContent = 'By model';
-        tokensBody.append(h);
-        tokensBody.append(
-          makeTable(
+        var models = data.byModel || [];
+        if (models.length > 0) {
+          var h = document.createElement('h3');
+          h.className = 'subhead';
+          h.style.margin = '1.25rem 0 0.5rem';
+          h.textContent = 'By model';
+          var wrap = document.createElement('div');
+          wrap.className = 'table-wrap';
+          wrap.append(table(
             ['Model', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
-            models.map((row) => [
-              row.model,
-              num(row.calls),
-              num(row.input_tokens),
-              num(row.output_tokens),
-              num(row.cache_read_input_tokens),
-              num(row.cache_creation_input_tokens),
-            ]),
-            1,
-          ),
-        );
-      }
+            models.map(function (row) {
+              return [
+                row.model,
+                num(row.calls),
+                num(row.input_tokens),
+                num(row.output_tokens),
+                num(row.cache_read_input_tokens),
+                num(row.cache_creation_input_tokens)
+              ];
+            }),
+            1
+          ));
+          tokensBody.append(h, wrap);
+        }
 
-      const recent = data.recent || [];
-      if (recent.length > 0) {
-        const h = document.createElement('h3');
-        h.className = 'subhead';
-        h.textContent = 'Recent calls';
-        tokensBody.append(h);
-        tokensBody.append(
-          makeTable(
+        var recent = data.recent || [];
+        if (recent.length > 0) {
+          var rh = document.createElement('h3');
+          rh.className = 'subhead';
+          rh.style.margin = '1.25rem 0 0.5rem';
+          rh.textContent = 'Recent calls';
+          var rwrap = document.createElement('div');
+          rwrap.className = 'table-wrap';
+          rwrap.append(table(
             ['Time', 'Model', 'Input', 'Output', 'Duration'],
-            recent.slice(0, 10).map((call) => [
-              new Date(call.at).toLocaleTimeString(),
-              call.model || '(unknown)',
-              num(call.input_tokens),
-              num(call.output_tokens),
-              call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's',
-            ]),
-            2,
-          ),
-        );
+            recent.slice(0, 10).map(function (call) {
+              return [
+                new Date(call.at).toLocaleTimeString(),
+                call.model || '(unknown)',
+                num(call.input_tokens),
+                num(call.output_tokens),
+                call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's'
+              ];
+            }),
+            2
+          ));
+          tokensBody.append(rh, rwrap);
+        }
       }
-    };
+    }
+    if (tokensSince && data) tokensSince.textContent = 'since ' + new Date(data.since).toLocaleString();
+  };
 
-    const loadTokens = async () => {
-      tokensSince.textContent = 'loading…';
-      try {
-        const r = await fetch('/admin/usage', { credentials: 'same-origin' });
-        const body = await r.json().catch(() => null);
-        if (!r.ok) {
-          tokensBody.innerHTML = '';
-          const p = document.createElement('p');
+  var loadTokens = function (quiet) {
+    if (!tokensBody && !recentBody && !tileCalls) return;
+    if (tokensSince && !quiet) tokensSince.textContent = 'loading…';
+    get('/admin/api/usage').then(function (result) {
+      if (!result.ok) {
+        var box = tokensBody || recentBody;
+        if (box) {
+          box.textContent = '';
+          var p = document.createElement('p');
           p.className = 'msg err';
-          p.style.margin = '0';
-          p.textContent = (body && body.error) || ('HTTP ' + r.status);
-          tokensBody.append(p);
-          tokensSince.textContent = '';
+          p.textContent = problem(result, 'Usage');
+          box.append(p);
+        }
+        return;
+      }
+      renderTokens(result.body);
+      renderRecent(result.body);
+    }).catch(function (error) {
+      if (tokensSince) tokensSince.textContent = String(error && error.message ? error.message : error);
+    });
+  };
+
+  // ---- Models page --------------------------------------------------------
+  var modelsBody = document.getElementById('models-body');
+  var modelsCount = document.getElementById('models-count');
+
+  var loadModels = function () {
+    if (!modelsBody) return;
+    modelsCount.textContent = 'loading…';
+    get('/admin/api/models').then(function (result) {
+      if (!result.ok) {
+        modelsBody.textContent = '';
+        var p = document.createElement('p');
+        p.className = 'msg err';
+        p.textContent = problem(result, 'Models');
+        modelsBody.append(p);
+        modelsCount.textContent = '';
+        return;
+      }
+      var models = (result.body && result.body.models) || [];
+      modelsBody.textContent = '';
+      if (models.length === 0) {
+        var empty = document.createElement('p');
+        empty.className = 'empty';
+        empty.textContent = 'The endpoint reported no models.';
+        modelsBody.append(empty);
+        modelsCount.textContent = '';
+        return;
+      }
+      var wrap = document.createElement('div');
+      wrap.className = 'table-wrap';
+      var node = document.createElement('table');
+      node.className = 'data';
+      var head = document.createElement('thead');
+      var headRow = document.createElement('tr');
+      ['Model id', 'Name'].forEach(function (label) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        headRow.append(th);
+      });
+      head.append(headRow);
+      var body = document.createElement('tbody');
+      models.forEach(function (model) {
+        var tr = document.createElement('tr');
+        var idCell = document.createElement('td');
+        idCell.className = 'mono strong';
+        idCell.textContent = model.id;
+        var nameCell = document.createElement('td');
+        nameCell.textContent = model.displayName && model.displayName !== model.id ? model.displayName : '—';
+        tr.append(idCell, nameCell);
+        body.append(tr);
+      });
+      node.append(head, body);
+      wrap.append(node);
+      modelsBody.append(wrap);
+      modelsCount.textContent = models.length + ' available';
+    }).catch(function (error) {
+      modelsCount.textContent = String(error && error.message ? error.message : error);
+    });
+  };
+
+  // ---- Users page ---------------------------------------------------------
+  var usersBodyEl = document.getElementById('users-table-body');
+  var usersCount = document.getElementById('users-count');
+  var usersError = document.getElementById('users-error');
+  var revealSlot = document.getElementById('reveal-slot');
+  var addForm = document.getElementById('add-user-form');
+
+  var stampOf = function (value) {
+    if (typeof value !== 'number' || !value) return '—';
+    return new Date(value).toISOString().replace('T', ' ').replace(/\\..*$/, '') + ' UTC';
+  };
+
+  var renderUsers = function (users) {
+    if (!usersBodyEl) return;
+    usersBodyEl.textContent = '';
+    if (users.length === 0) {
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.style.padding = '1rem';
+      empty.textContent = 'No users yet.';
+      usersBodyEl.append(empty);
+      if (usersCount) usersCount.textContent = '0 total';
+      return;
+    }
+    var wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    var node = document.createElement('table');
+    node.className = 'data';
+    node.id = 'users-table';
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['Name', 'Role', 'Status', 'Created', 'Last used', 'Actions'].forEach(function (label, index) {
+      var th = document.createElement('th');
+      th.textContent = label;
+      if (index === 5) th.className = 'num';
+      headRow.append(th);
+    });
+    head.append(headRow);
+    var body = document.createElement('tbody');
+    users.forEach(function (user) {
+      var tr = document.createElement('tr');
+      var nameCell = document.createElement('td');
+      nameCell.className = 'strong';
+      nameCell.textContent = user.name;
+      if (user.legacy) {
+        var badge = document.createElement('span');
+        badge.className = 'pill accent';
+        badge.textContent = 'env bearer';
+        badge.style.marginLeft = '0.5rem';
+        nameCell.append(' ', badge);
+      }
+      var roleCell = document.createElement('td');
+      var roleCode = document.createElement('code');
+      roleCode.textContent = user.role;
+      roleCell.append(roleCode);
+      var statusCell = document.createElement('td');
+      var status = document.createElement('span');
+      status.className = 'pill ' + (user.disabled ? 'off' : 'on');
+      status.textContent = user.disabled ? 'disabled' : 'enabled';
+      statusCell.append(status);
+      var createdCell = document.createElement('td');
+      createdCell.className = 'when';
+      createdCell.textContent = stampOf(user.createdAt);
+      var usedCell = document.createElement('td');
+      usedCell.className = 'when';
+      usedCell.textContent = stampOf(user.lastUsedAt);
+      var actionsCell = document.createElement('td');
+      actionsCell.className = 'actions';
+      if (user.legacy) {
+        var fixed = document.createElement('span');
+        fixed.className = 'hint';
+        fixed.textContent = 'set by the environment';
+        actionsCell.append(fixed);
+      } else {
+        // Both this renderer and the server-rendered table emit the same
+        // data-action contract, and one delegated listener below serves both.
+        // Attaching a listener per button would leave the server-rendered rows
+        // dead whenever the refresh request fails.
+        var toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'small';
+        toggle.textContent = user.disabled ? 'Enable' : 'Disable';
+        toggle.setAttribute('data-action', 'toggle');
+        toggle.setAttribute('data-id', user.id);
+        toggle.setAttribute('data-disabled', user.disabled ? 'true' : 'false');
+        toggle.setAttribute('aria-label', (user.disabled ? 'Enable user ' : 'Disable user ') + user.name);
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'small danger';
+        remove.textContent = 'Remove';
+        remove.setAttribute('data-action', 'remove');
+        remove.setAttribute('data-id', user.id);
+        remove.setAttribute('data-name', user.name);
+        remove.setAttribute('aria-label', 'Remove user ' + user.name);
+        actionsCell.append(toggle, remove);
+      }
+      tr.append(nameCell, roleCell, statusCell, createdCell, usedCell, actionsCell);
+      body.append(tr);
+    });
+    node.append(head, body);
+    wrap.append(node);
+    usersBodyEl.append(wrap);
+    if (usersCount) usersCount.textContent = users.length + ' total';
+  };
+
+  var loadUsers = function () {
+    if (!usersBodyEl) return;
+    get('/admin/api/users').then(function (result) {
+      if (!result.ok) {
+        showError(usersError, problem(result, 'Users'));
+        return;
+      }
+      renderUsers((result.body && result.body.users) || []);
+    });
+  };
+
+  var revealToken = function (user, token) {
+    if (!revealSlot) return;
+    revealSlot.textContent = '';
+    var panel = document.createElement('section');
+    panel.className = 'reveal';
+    panel.setAttribute('role', 'status');
+    var title = document.createElement('h2');
+    title.textContent = 'New token for ' + user.name;
+    var warning = document.createElement('p');
+    warning.textContent = 'This is the only time this token is shown. Only a hash is stored, so it cannot be recovered later. Copy it now.';
+    var line = document.createElement('div');
+    line.className = 'token-line';
+    var code = document.createElement('code');
+    code.className = 'token';
+    code.textContent = token;
+    var copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'primary';
+    copy.textContent = 'Copy';
+    copy.setAttribute('aria-label', 'Copy the token for ' + user.name);
+    copy.addEventListener('click', function () {
+      var done = function () { copy.textContent = 'Copied'; };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(token).then(done, function () { selectToken(); });
+      } else {
+        selectToken();
+      }
+      function selectToken() {
+        var range = document.createRange();
+        range.selectNodeContents(code);
+        var selection = window.getSelection();
+        if (selection) {
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        copy.textContent = 'Selected — press Ctrl+C';
+      }
+    });
+    var dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'ghost';
+    dismiss.textContent = 'Dismiss';
+    dismiss.addEventListener('click', function () { revealSlot.textContent = ''; });
+    line.append(code, copy);
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.append(dismiss);
+    panel.append(title, warning, line, row);
+    revealSlot.append(panel);
+    panel.scrollIntoView({ block: 'nearest' });
+    copy.focus();
+  };
+
+  var patchUser = function (id, patch) {
+    return send('/admin/api/users/' + encodeURIComponent(id), 'PATCH', patch).then(function (result) {
+      if (!result.ok) {
+        showError(usersError, problem(result, 'Update'));
+        return;
+      }
+      usersError.hidden = true;
+      return loadUsers();
+    });
+  };
+
+  var armRemove = function (button, name) {
+    if (button.dataset.armed === 'true') {
+      send('/admin/api/users/' + encodeURIComponent(button.dataset.id), 'DELETE').then(function (result) {
+        if (!result.ok) {
+          showError(usersError, problem(result, 'Remove'));
           return;
         }
-        renderTokens(body);
-        tokensSince.textContent = 'since ' + new Date(body.since).toLocaleString();
-      } catch (e) {
-        tokensSince.textContent = String(e.message || e);
-      }
-    };
-
-    document.getElementById('refresh-usage').addEventListener('click', () => void loadUsage());
-    document.getElementById('refresh-models').addEventListener('click', () => void loadModels());
-    document.getElementById('refresh-usage-tokens').addEventListener('click', () => void loadTokens());
-    void loadUsage();
-    void loadModels();
-    void loadTokens();
-
-    const start = document.getElementById('start');
-    const cancel = document.getElementById('cancel');
-    let currentId = null;
-
-    const showPaste = (id, url) => {
-      currentId = id;
-      cancel.disabled = false;
-      stage.innerHTML = '';
-      const p = document.createElement('p');
-      p.className = 'hint';
-      p.style.marginTop = '0';
-      p.textContent = 'If the tab did not open, use this link:';
-      const a = document.createElement('a');
-      a.href = url;
-      a.target = '_blank';
-      a.rel = 'noopener';
-      a.textContent = 'Open authorize page';
-      stage.append(p, a);
-
-      const label = document.createElement('label');
-      label.textContent = 'Paste the full callback address';
-      label.style.marginTop = '.9rem';
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.autocomplete = 'off';
-      input.spellcheck = false;
-      input.placeholder = 'http://localhost:53692/callback?code=…&state=…';
-      const row = document.createElement('div');
-      row.className = 'row';
-      const submit = document.createElement('button');
-      submit.className = 'primary';
-      submit.textContent = 'Finish sign-in';
-      const err = document.createElement('p');
-      err.className = 'msg err';
-      err.style.display = 'none';
-
-      submit.addEventListener('click', async () => {
-        submit.disabled = true;
-        const r = await post('/admin/login/complete', { id: currentId, code: input.value });
-        if (r.ok) location.reload();
-        else {
-          submit.disabled = false;
-          err.style.display = 'block';
-          err.textContent = (r.body && r.body.error) || ('HTTP ' + r.status);
-        }
+        usersError.hidden = true;
+        return loadUsers();
       });
-      row.append(submit);
-      stage.append(label, input, row, err);
-      input.focus();
+      return;
+    }
+    // Two-step confirmation rather than window.confirm: a browser dialog blocks
+    // the page, cannot be styled, and looks identical to a popup.
+    button.dataset.armed = 'true';
+    button.textContent = 'Confirm remove';
+    button.setAttribute('aria-label', 'Confirm removing user ' + name);
+    var reset = function () {
+      if (button.dataset.armed !== 'true') return;
+      button.dataset.armed = 'false';
+      button.textContent = 'Remove';
+      button.setAttribute('aria-label', 'Remove user ' + name);
     };
+    setTimeout(reset, 5000);
+    button.addEventListener('blur', reset, { once: true });
+  };
 
-    start.addEventListener('click', async () => {
-      start.disabled = true;
-      const r = await post('/admin/login/start');
-      if (r.ok && r.body && r.body.url) {
-        window.open(r.body.url, '_blank', 'noopener');
-        showPaste(r.body.id, r.body.url);
-      } else {
-        start.disabled = false;
-        alert((r.body && r.body.error) || ('HTTP ' + r.status));
+  // One delegated listener for both renderers. Both the server-rendered table
+  // and the one rebuilt after a change carry the same data-action contract, so
+  // a row cannot be interactive in one path and dead in the other.
+  if (usersBodyEl) {
+    usersBodyEl.addEventListener('click', function (event) {
+      var button = event.target && event.target.closest ? event.target.closest('button[data-action]') : null;
+      if (button === null) return;
+      if (button.dataset.action === 'toggle') {
+        void patchUser(button.dataset.id, { disabled: button.dataset.disabled !== 'true' });
+        return;
       }
-    });
-
-    cancel.addEventListener('click', async () => {
-      if (currentId) await post('/admin/login/cancel', { id: currentId });
-      location.reload();
+      if (button.dataset.action === 'remove') {
+        armRemove(button, button.dataset.name || 'this user');
+      }
     });
   }
+
+  if (addForm) {
+    var addButton = document.getElementById('add-user');
+    var nameInput = document.getElementById('user-name');
+    var roleInput = document.getElementById('user-role');
+    addForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      addButton.disabled = true;
+      usersError.hidden = true;
+      post('/admin/api/users', { name: nameInput.value, role: roleInput.value }).then(function (result) {
+        addButton.disabled = false;
+        if (!result.ok) {
+          showError(usersError, problem(result, 'Create'));
+          return;
+        }
+        nameInput.value = '';
+        revealToken(result.body.user, result.body.token);
+        return loadUsers();
+      }).catch(function (error) {
+        addButton.disabled = false;
+        showError(usersError, String(error && error.message ? error.message : error));
+      });
+    });
+  }
+
+  // ---- Account page: the authorization-code sign-in ----------------------
+  var start = document.getElementById('start');
+  var cancel = document.getElementById('cancel');
+  var stage = document.getElementById('stage');
+  var currentId = null;
+
+  var showPaste = function (id, url) {
+    currentId = id;
+    cancel.disabled = false;
+    stage.textContent = '';
+    var hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.style.marginTop = '0.75rem';
+    hint.textContent = 'If the tab did not open, use this link:';
+    var link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.textContent = 'Open the authorize page';
+    stage.append(hint, link);
+
+    var field = document.createElement('div');
+    field.className = 'field';
+    field.style.marginTop = '0.9rem';
+    var label = document.createElement('label');
+    label.setAttribute('for', 'callback');
+    label.textContent = 'Paste the full callback address';
+    var input = document.createElement('input');
+    input.id = 'callback';
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.placeholder = 'http://localhost:53692/callback?code=…&state=…';
+    field.append(label, input);
+
+    var row = document.createElement('div');
+    row.className = 'row';
+    var submit = document.createElement('button');
+    submit.className = 'primary';
+    submit.type = 'button';
+    submit.textContent = 'Finish sign-in';
+    var err = document.createElement('p');
+    err.className = 'msg err';
+    err.hidden = true;
+
+    submit.addEventListener('click', function () {
+      submit.disabled = true;
+      post('/admin/api/login/complete', { id: currentId, code: input.value }).then(function (result) {
+        if (result.ok) {
+          window.location.reload();
+          return;
+        }
+        submit.disabled = false;
+        showError(err, (result.body && result.body.error) || ('HTTP ' + result.status));
+      });
+    });
+    row.append(submit);
+    stage.append(field, row, err);
+    input.focus();
+  };
+
+  if (start) {
+    start.addEventListener('click', function () {
+      start.disabled = true;
+      post('/admin/api/login/start').then(function (result) {
+        if (result.ok && result.body && result.body.url) {
+          window.open(result.body.url, '_blank', 'noopener');
+          showPaste(result.body.id, result.body.url);
+          return;
+        }
+        start.disabled = false;
+        window.alert((result.body && result.body.error) || ('HTTP ' + result.status));
+      });
+    });
+  }
+
+  if (cancel) {
+    cancel.addEventListener('click', function () {
+      var id = currentId;
+      if (id) post('/admin/api/login/cancel', { id: id }).then(function () { window.location.reload(); });
+      else window.location.reload();
+    });
+  }
+
+  // ---- wire up whatever this page has ------------------------------------
+  [
+    ['refresh-usage', loadUsage],
+    ['refresh-models', loadModels],
+    ['refresh-usage-tokens', function () { void loadTokens(false); }]
+  ].forEach(function (pair) {
+    var node = document.getElementById(pair[0]);
+    if (node) node.addEventListener('click', pair[1]);
+  });
+
+  if (usageBody) loadUsage();
+  if (tokensBody || recentBody || tileCalls) loadTokens(true);
+  if (modelsBody) loadModels();
 })();
-</script>
-</body>
-</html>`;
-}
+`;

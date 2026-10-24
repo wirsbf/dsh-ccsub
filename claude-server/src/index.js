@@ -13,6 +13,7 @@ import { loadConfig } from './config.js';
 import { GrantStore } from './grant.js';
 import { createServer } from './server.js';
 import { Transport } from './transport.js';
+import { UserDirectory } from './users.js';
 
 /** A minimal leveled logger; the container's stdout is the sink. */
 function createLogger(level) {
@@ -42,8 +43,13 @@ async function main() {
     refreshSkewMs: config.refreshSkewMs,
     logger,
   });
+  // Constructing the directory touches no disk: the file is created on the first
+  // user. A deployment whose volume is missing or read-only therefore still
+  // starts and still serves the relay through the environment bearer; only
+  // creating a user fails, which is the failure worth having in that situation.
+  const users = new UserDirectory({ path: config.usersPath, logger });
 
-  const { server, dispose } = createServer({ config, transport, grants, logger });
+  const { server, dispose } = createServer({ config, transport, grants, users, logger });
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);

@@ -122,7 +122,7 @@ system 块是 `You are Claude Code, Anthropic's official CLI for Claude.`。在�
 | 凭据在哪 | 本进程 | ✗ —— 服务端持有 |
 | 谁刷新 token | 本进程 | ✗ —— 服务端是唯一刷新者 |
 | 与 Anthropic 通信 | ✓ 经强制代理 | ✗ —— 只与服务端通信 |
-| 本进程持有的凭据 | 订阅 token | 服务端签发的通信密钥（bearer） |
+| 本进程持有的凭据 | 订阅 token | 服务端为这台机器签发的令牌 |
 | proxy 配置 | 必需 | 不使用 |
 | 配额探测 | 本地 | 由服务端提供 |
 
@@ -179,7 +179,12 @@ dsh plugin --profile web add /home/<user>/DEV/dsh-ccsub
 |---|---|
 | Mode（模式） | `claude-server` |
 | Server URL（服务器地址） | 部署的 origin，例如 `https://claude.example.com` |
-| Client bearer（客户端 bearer） | 服务器启动时设的 `CLIENT_BEARER` 值 |
+| Client bearer（客户端 bearer） | 在服务端 Users（用户）页签发的令牌 |
+
+先在服务端签发令牌：打开服务端控制台（`<server>/admin`），用管理令牌解锁，在
+**Users（用户）** 页添加用户。令牌只在创建时显示一次。环境变量里的
+`CLIENT_BEARER` 仍然可用，它是管理员引导凭据；但把管理令牌分发给每个客户端，
+就失去了区分角色的意义。
 
 这个模式下，粘贴 bearer 就是全部登录流程：没有浏览器 OAuth 那一步，因为授权
 （grant）已经在服务器上，并由服务器负责刷新。粘贴之前先确认服务器就绪：
@@ -276,8 +281,10 @@ dsh plugin --profile web add /绝对路径/dsh-ccsub-<version>.tgz
 | `POST /plugins/dsh-ccsub/logout` | 删除已存储的凭据 |
 | `POST /plugins/dsh-ccsub/server/bearer` | 写入或清除 claude-server 的通信密钥 |
 
-服务端自己的控制台另有 `GET /admin/usage`，报告 [`claude-server/`](claude-server/)
-里的 token 统计。
+服务端自己的控制台是一个独立的多页浏览器应用，使用自己的会话 cookie 认证：
+页面有概览、账户、用户、用量、模型五页，JSON 接口在 `/admin/api/*` 下，
+详见 [`claude-server/`](claude-server/)。它不属于本插件的 HTTP 接口，
+插件的令牌打不开它。
 
 ## 目录结构
 
@@ -296,7 +303,7 @@ lib/
 
 claude-server/      独立的订阅服务端（见它自己的 README）
   src/              身份、凭据、oauth、鉴权、净化、传输、转发、用量统计
-  test/             63 项离线检查；不走网络
+  test/             104 项离线检查；不走网络
 ```
 
 ## 致谢

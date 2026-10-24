@@ -143,7 +143,7 @@ disposal.
 | Grant lives here | ✓ | ✗ — the server holds it |
 | Refreshes the token | ✓ | ✗ — the server is the only refresher |
 | Talks to Anthropic | ✓ through the mandatory proxy | ✗ — only to the server |
-| Credential this process holds | the subscription token | a client bearer the server minted |
+| Credential this process holds | the subscription token | a token the server minted for this machine |
 | Proxy block | required | unused |
 | Quota probe | local | served by the server |
 
@@ -203,12 +203,22 @@ Subscription**:
 |---|---|
 | Mode | `claude-server` |
 | Server URL | the deployment's origin, e.g. `https://claude.example.com` |
-| Client bearer | the server's `CLIENT_BEARER` env value |
+| Client bearer | a token issued on the server's Users page |
 
 The bearer paste box is the whole sign-in flow in this mode: there is no browser
 OAuth step, because the server already holds the grant and refreshes it. A
 `GET <server>/healthz` returning `{"ok":true,"signedIn":true}` confirms the
 server half is ready before you paste anything.
+
+Issue the token on the server first: open the server console (`<server>/admin`),
+unlock it with an admin token, and add a user on the **Users** page. The token is
+shown once at creation. `CLIENT_BEARER` from the environment still works and is
+the admin bootstrap, but handing every client the admin token defeats the point
+of having roles.
+
+The card reports this mode as `Connected` / `No backend configured`, not as a
+sign-in state. That is deliberate: the grant lives on the server, so this
+process holds no local grant even when the route is working perfectly.
 
 Two things that are easy to get wrong here:
 
@@ -333,8 +343,10 @@ edits there take effect on the next host restart.
 | `POST /plugins/dsh-ccsub/logout` | Delete the stored grant |
 | `POST /plugins/dsh-ccsub/server/bearer` | Store or clear the claude-server client bearer |
 
-The server's own console adds `GET /admin/usage`, which reports the token
-accounting described in [`claude-server/`](claude-server/).
+The server's own console is a separate, multi-page browser app authenticated by
+its own session cookie — see [`claude-server/`](claude-server/) for its pages and
+`/admin/api/*` routes. It is not part of this plugin's HTTP surface, and a token
+for this plugin does not unlock it.
 
 ## Layout
 
@@ -350,10 +362,12 @@ lib/
     flow.js         ctx.authorization flow (pi-ai events → seam vocabulary)
     bridge.js       Host-side sign-in conversation for the settings card
   client/index.js   Browser settings card
+test/               41 offline checks; no network
 
 claude-server/      The separate subscription server (see its own README)
-  src/              identity, grant, oauth, auth, sanitize, transport, relay, usage
-  test/             63 offline checks; no network
+  src/              identity, grant, oauth, auth, users, sanitize, transport, relay,
+                    usage, admin (multi-page console), admin-style
+  test/             104 offline checks; no network
 ```
 
 ## Credits

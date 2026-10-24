@@ -8,6 +8,8 @@
  * @module claude-server/config
  */
 
+import { dirname, join } from 'node:path';
+
 /** Read a boolean-ish environment value. */
 function bool(value, fallback) {
   if (value === undefined || value === '') return fallback;
@@ -18,6 +20,21 @@ function bool(value, fallback) {
 function int(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * The user file's default location: beside the grant.
+ *
+ * Derived from `GRANT_PATH` rather than hardcoded to `/data`, because the grant
+ * is the thing the volume already exists for. A local run that points
+ * `GRANT_PATH` at a scratch directory then gets its user file in the same
+ * scratch directory instead of writing to a container path that does not exist
+ * on the host.
+ * @param grantPath - the resolved grant path.
+ * @returns the default user file path.
+ */
+function defaultUsersPath(grantPath) {
+  return join(dirname(grantPath), 'users.json');
 }
 
 /**
@@ -35,12 +52,15 @@ export function loadConfig(env = process.env) {
   const listenPort = int(env.LISTEN_PORT, 4710);
   const grantPath = String(env.GRANT_PATH ?? '/data/grant.json').trim();
   if (grantPath.length === 0) throw new Error('GRANT_PATH must not be empty');
+  const usersPath = String(env.USERS_PATH ?? defaultUsersPath(grantPath)).trim();
+  if (usersPath.length === 0) throw new Error('USERS_PATH must not be empty');
   return {
     listenHost,
     listenPort,
     mode,
     proxyUrl: env.PROXY_URL,
     grantPath,
+    usersPath,
     clientBearer: env.CLIENT_BEARER,
     claudeCliVersion: String(env.CLAUDE_CLI_VERSION ?? '2.1.303').trim() || '2.1.303',
     // Pinned rather than read from this process: the claimed runtime must not

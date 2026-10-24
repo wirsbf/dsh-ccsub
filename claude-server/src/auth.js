@@ -1,22 +1,42 @@
 /**
- * Client authentication: who may use this server's subscription.
+ * Client authentication: who may use this server's subscription, and who may
+ * administer it.
  *
  * The server listens on an interface reachable by other machines, so it must
  * refuse unknown callers before doing any work. The credential it checks is a
- * bearer that this server's operator minted — not the Claude token. A leaked
+ * bearer that this server's operator issued — not the Claude token. A leaked
  * bearer costs subscription quota; it cannot be used to obtain the Claude
  * credential, which never leaves this process.
  *
- * Comparison is constant-time over equal-length buffers. Length is compared
- * first, which does leak the length of the secret — an acceptable trade, since
- * a length oracle on a long random string is not a practical attack and the
- * alternative (padding every candidate) hides nothing an attacker cannot
- * already infer from a successful guess.
+ * ## Two questions, not one
+ *
+ * The relay only needs "is this a live user of any role". The console needs
+ * "is this an admin", because the console can issue more users and replace the
+ * Claude grant. Keeping the two questions separate is what makes a `client`
+ * token a relay credential rather than an administrative one: a user who can
+ * call models cannot mint users or overwrite the grant.
+ *
+ * ## The environment bearer is still here
+ *
+ * `CLIENT_BEARER` is the bootstrap credential. It cannot be removed from a
+ * running deployment without editing its environment, so it is synthesized as a
+ * permanent `legacy` admin rather than migrated away. The alternative — a
+ * migration that deletes the env value — would make an upgrade a one-way door
+ * and would strand any deployment whose users file never got created.
+ *
+ * ## Constant time
+ *
+ * Every secret comparison is `timingSafeEqual` over equal-length buffers, for
+ * the environment bearer and for stored token hashes alike. The token hash is
+ * also compared against every active row rather than stopping at a match, and
+ * disabled rows still take part, so the comparison work does not reveal which
+ * user (if any) a guessed token belongs to.
  *
  * @module claude-server/auth
  */
 
 import { timingSafeEqual } from 'node:crypto';
+import { LEGACY_USER_ID, LEGACY_USER_NAME } from './users.js';
 
 /** The scheme the client must use. */
 const SCHEME = 'bearer';
@@ -54,16 +74,18 @@ export function secretsMatch(presented, expected) {
 }
 
 /**
- * A configured client secret plus the check the HTTP layer runs.
+ * The configured bootstrap bearer plus the checks the HTTP layer runs.
  */
 export class ClientAuth {
   #expected;
+  #users;
 
   /**
    * @param expected - the bearer this server accepts.
+   * @param options - `users`, the user directory, when multi-user support is mounted.
    * @throws {Error} when the secret is missing or too short to be meaningful.
    */
-  constructor(expected) {
+  constructor(expected, options = {}) {
     if (typeof expected !== 'string' || expected.trim().length === 0) {
       throw new Error(
         'CLIENT_BEARER is not configured; this server refuses to run without a client credential because it listens beyond loopback',
@@ -76,16 +98,75 @@ export class ClientAuth {
       );
     }
     this.#expected = value;
+    this.#users = options.users;
+  }
+
+  /** The identity the environment bearer maps to. */
+  get legacyIdentity() {
+    return { id: LEGACY_USER_ID, name: LEGACY_USER_NAME, role: 'admin', legacy: true };
   }
 
   /**
-   * Check one Authorization header.
+   * Whether a header carries the environment bearer.
+   *
+   * Kept synchronous and bearer-only: it is the bootstrap credential, and this
+   * is the check that must keep working when the user file is missing or
+   * corrupt.
    * @param header - the raw header value.
-   * @returns true when the caller may proceed.
+   * @returns true when the caller presented the configured bearer.
    */
   check(header) {
     const token = bearerOf(header);
     if (token === undefined) return false;
     return secretsMatch(token, this.#expected);
+  }
+
+  /**
+   * Resolve any presented credential to an identity.
+   *
+   * The environment bearer is checked first because it is the one credential
+   * that cannot be revoked, and its comparison is the cheapest. A stored user is
+   * only consulted when the header is not the environment bearer.
+   * @param header - the raw header value.
+   * @returns the identity, or undefined when the credential is not valid.
+   */
+  async identify(header) {
+    const token = bearerOf(header);
+    if (token === undefined) return undefined;
+    if (this.#users === undefined) return this.check(header) ? this.legacyIdentity : undefined;
+    // Run both checks rather than short-circuiting on the environment bearer:
+    // an early return would make a wrong token's timing depend on whether it
+    // happened to be the bootstrap credential.
+    const legacy = secretsMatch(token, this.#expected);
+    const stored = await this.#users.verify(token);
+    if (legacy) return this.legacyIdentity;
+    return stored;
+  }
+
+  /**
+   * Whether a header carries a credential allowed to use the relay.
+   *
+   * Any live user of either role qualifies: the relay is the product, and a
+   * `client` role exists precisely to be usable without being administrative.
+   * @param header - the raw header value.
+   * @returns the identity, or undefined.
+   */
+  async checkUser(header) {
+    return await this.identify(header);
+  }
+
+  /**
+   * Whether a header carries an administrative credential.
+   *
+   * This is the console gate. A `client` token must get nothing here: the
+   * console can create users and replace the Claude grant, so treating every
+   * relay credential as administrative would let any relay user escalate.
+   * @param header - the raw header value.
+   * @returns the identity, or undefined unless it is an enabled admin.
+   */
+  async checkAdmin(header) {
+    const identity = await this.identify(header);
+    if (identity === undefined) return undefined;
+    return identity.role === 'admin' ? identity : undefined;
   }
 }

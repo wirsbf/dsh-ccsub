@@ -1,18 +1,26 @@
 /**
  * The HTTP surface.
  *
- * Two kinds of route:
+ * Four kinds of route:
  *
- * - `/login/*` — authorization-code sign-in. These are the only routes that do
- *   not require the client bearer… except they do: minting or completing a
- *   grant over an unauthenticated channel would let anyone on the network bind
- *   their own Claude account (or reset the operator's). They require it too.
+ * - `/healthz` — liveness. The single unauthenticated route; it reports whether
+ *   a grant exists and the transport mode, and nothing that could help an
+ *   attacker (no paths, no token material, no upstream identity).
+ * - `/admin/*` — the operator console. It authenticates through its own session
+ *   cookie rather than the bearer, because a browser cannot send an
+ *   `Authorization` header on a top-level navigation. Pages are HTML; everything
+ *   under `/admin/api/` is JSON and answers 401 JSON when the session is absent
+ *   or expired, never an HTML page.
+ * - `/login/*` and `/status` — the scripted, non-browser view of the same state.
+ *   These require an **admin** credential: `/login/*` can mint or replace the
+ *   Claude grant, so admitting a `client` token here would make every relay user
+ *   an administrator by another name.
  * - everything else — a transparent relay to Anthropic, with the client bearer
  *   swapped for the real access token and the Claude Code identity re-asserted.
+ *   Any live user of either role may call it: the relay is the product.
  *
- * `/healthz` is the single unauthenticated route. It reports liveness and
- * whether a grant exists, and nothing that could help an attacker (no paths, no
- * token material, no upstream identity).
+ * The role split is the whole point of the user directory. A `client` token can
+ * spend quota; it cannot mint users, unlock the console, or replace the grant.
  *
  * @module claude-server/server
  */
@@ -21,7 +29,16 @@ import http from 'node:http';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
-import { ADMIN_COOKIE, ADMIN_PREFIX, AdminSessions, cookieOf, renderAdminPage } from './admin.js';
+import {
+  ADMIN_COOKIE,
+  ADMIN_HOME,
+  ADMIN_PREFIX,
+  AdminSessions,
+  cookieOf,
+  pageForPath,
+  renderConsolePage,
+  renderLockPage,
+} from './admin.js';
 import { ClientAuth } from './auth.js';
 import { THINKING_BETAS, ensureBaseBetas, wantsThinkingBetas, withClaudeIdentity } from './identity.js';
 import { LoginSessions } from './login.js';
@@ -29,9 +46,15 @@ import { exchangeCode, parseAuthorizationInput, refreshGrant } from './oauth.js'
 import { sanitizeBody } from './sanitize.js';
 import { hasJsonBody, upstreamFor } from './upstream.js';
 import { UsageLedger, UsageObserver } from './usage.js';
+import { UserDirectory, UsersError } from './users.js';
 
 /** Responses must never be cached by an intermediary. */
 const NO_STORE = 'no-store';
+
+/** The console cookie: HttpOnly, Strict, scoped to the console path. */
+function sessionCookie(id, maxAgeSeconds) {
+  return `${ADMIN_COOKIE}=${id}; Path=${ADMIN_PREFIX}; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}`;
+}
 
 /**
  * Send a JSON reply.
@@ -74,14 +97,33 @@ async function readBody(req, limit) {
   return Buffer.concat(chunks);
 }
 
+/** Parse a JSON request body, or reply 400 and return undefined. */
+async function readJson(req, res, limit) {
+  try {
+    return JSON.parse((await readBody(req, limit)).toString('utf8') || '{}');
+  } catch {
+    sendJson(res, 400, { error: 'the request body must be JSON', code: 'BAD_BODY' });
+    return undefined;
+  }
+}
+
 /**
  * Build the server.
- * @param options - config, transport, grant store, and logger.
+ * @param options - config, transport, grant store, user directory, and logger.
  * @returns the http.Server plus a dispose hook.
  */
 export function createServer(options) {
   const { config, transport, grants, logger, hosts } = options;
-  const auth = new ClientAuth(config.clientBearer);
+  // The directory is injected by the entry point. A caller that provides no
+  // directory still gets a working relay for the environment bearer; only the
+  // user-management routes are unavailable, which keeps the console meaningful
+  // on a deployment that has not mounted a writable volume.
+  const users =
+    options.users ??
+    (typeof config?.usersPath === 'string' && config.usersPath.length > 0
+      ? new UserDirectory({ path: config.usersPath, logger })
+      : undefined);
+  const auth = new ClientAuth(config.clientBearer, { users });
   const sessions = new LoginSessions({ ttlMs: config.loginTtlMs });
   const adminSessions = new AdminSessions();
   // Console reads of the usage endpoint share this cache. Anthropic rate-limits
@@ -113,6 +155,12 @@ export function createServer(options) {
     res.end(html);
   };
 
+  /** A 302 that never carries a body. */
+  const sendRedirect = (res, location) => {
+    res.writeHead(302, { location, 'cache-control': NO_STORE, 'content-length': 0 });
+    res.end();
+  };
+
   /** Read the current grant state without letting a corrupt file throw. */
   const grantState = async () => {
     try {
@@ -126,70 +174,123 @@ export function createServer(options) {
     }
   };
 
+  /** Read the user list, or an empty list when the directory is unusable. */
+  const userList = async () => {
+    if (users === undefined) return [];
+    try {
+      return await users.list();
+    } catch (error) {
+      logger.warn('could not read the user directory: %s', String(error?.message ?? error));
+      return [];
+    }
+  };
+
   /**
    * The operator console, mounted under `/admin`.
    *
-   * The page itself is served to anyone who can reach the port, but it shows
-   * nothing but a login form until a valid client bearer has been exchanged for
-   * a session cookie. Every mutating call checks that cookie again, so serving
-   * the shell to an unauthenticated caller grants nothing.
+   * Pages are served to anyone who can reach the port, but a page that is not
+   * the lock page requires a live session; without one it redirects to `/admin`
+   * rather than rendering anything. Every JSON call under `/admin/api/` checks
+   * the cookie again, so serving the lock page to an unauthenticated caller
+   * grants nothing.
    */
   const admin = async (req, res, ctx) => {
     const { pathname } = ctx;
     const sessionId = cookieOf(req.headers.cookie, ADMIN_COOKIE);
-    const authed = adminSessions.valid(sessionId);
+    const signedIn = adminSessions.valid(sessionId);
+    const identity = signedIn ? adminSessions.identityOf(sessionId) : undefined;
 
-    // --- the page ---------------------------------------------------------
-    if (pathname === ADMIN_PREFIX && req.method === 'GET') {
+    // Wrap a JSON handler so an unexpected throw becomes a JSON 500 rather than
+    // an HTML error page (which would break every client of these routes).
+    const api = (handler) => async () => {
+      try {
+        await handler();
+      } catch (error) {
+        if (error instanceof UsersError) {
+          sendJson(res, error.code === 'UNKNOWN_USER' ? 404 : 400, {
+            error: error.message,
+            code: error.code,
+          });
+          return;
+        }
+        logger.error('console api failure: %s', String(error?.message ?? error));
+        if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
+      }
+    };
+
+    // --- pages ------------------------------------------------------------
+    if (req.method === 'GET' && (pathname === ADMIN_PREFIX || pathname === `${ADMIN_PREFIX}/`)) {
+      if (!signedIn) {
+        const state = await grantState();
+        sendHtml(res, 200, renderLockPage({ ...state, mode: transport.mode }));
+        return;
+      }
+      sendRedirect(res, ADMIN_HOME);
+      return;
+    }
+
+    const page = req.method === 'GET' ? pageForPath(pathname) : undefined;
+    if (page !== undefined) {
+      if (!signedIn) {
+        sendRedirect(res, ADMIN_PREFIX);
+        return;
+      }
       const state = await grantState();
       sendHtml(
         res,
         200,
-        renderAdminPage({ ...state, mode: transport.mode, authed }),
+        renderConsolePage({
+          page,
+          ...state,
+          mode: transport.mode,
+          cliVersion: config.claudeCliVersion,
+          identity,
+          // Only the pages that show a user count pay for the read.
+          users: page === 'users' || page === 'overview' ? await userList() : [],
+        }),
       );
       return;
     }
 
-    // --- unlock: bearer in, session cookie out ---------------------------
-    if (pathname === `${ADMIN_PREFIX}/session` && req.method === 'POST') {
-      let payload;
-      try {
-        payload = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8') || '{}');
-      } catch {
-        sendJson(res, 400, { error: 'the request body must be JSON', code: 'BAD_BODY' });
-        return;
-      }
+    // --- unlock: bearer in, session cookie out ----------------------------
+    if (pathname === `${ADMIN_PREFIX}/api/session` && req.method === 'POST') {
+      const payload = await readJson(req, res, 8 * 1024);
+      if (payload === undefined) return;
       const presented = typeof payload?.bearer === 'string' ? payload.bearer.trim() : '';
-      if (!auth.check(`Bearer ${presented}`)) {
-        // Deliberately vague and rate-limit-free at this size: the bearer is a
+      // Admin credentials only: a `client` token must not mint a session, or any
+      // relay user could create more users or replace the Claude grant.
+      const who = await auth.checkAdmin(`Bearer ${presented}`);
+      if (who === undefined) {
+        // Deliberately vague and rate-limit-free at this size: the token is a
         // long random string, so guessing is not the threat model.
-        logger.warn('console unlock refused: bad client bearer');
-        sendJson(res, 401, { error: 'that bearer was not accepted' });
+        if (presented.length === 0) logger.warn('console unlock refused: no token presented');
+        else logger.warn('console unlock refused: the token is not an enabled admin');
+        sendJson(res, 401, { error: 'that token was not accepted' });
         return;
       }
-      const id = adminSessions.create();
+      const id = adminSessions.create(who);
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
         'cache-control': NO_STORE,
-        'set-cookie': `${ADMIN_COOKIE}=${id}; Path=${ADMIN_PREFIX}; HttpOnly; SameSite=Strict; Max-Age=${30 * 60}`,
+        'set-cookie': sessionCookie(id, 30 * 60),
       });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
 
-    if (pathname === `${ADMIN_PREFIX}/logout` && req.method === 'POST') {
+    if (pathname === `${ADMIN_PREFIX}/api/logout` && req.method === 'POST') {
       adminSessions.destroy(sessionId);
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
         'cache-control': NO_STORE,
-        'set-cookie': `${ADMIN_COOKIE}=; Path=${ADMIN_PREFIX}; HttpOnly; SameSite=Strict; Max-Age=0`,
+        'set-cookie': sessionCookie('', 0),
       });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
 
     // Everything below mutates or reveals credential state.
-    if (!authed) {
+    if (!signedIn) {
       sendJson(res, 401, { error: 'the console session is missing or expired; unlock again' });
       return;
     }
@@ -238,66 +339,177 @@ export function createServer(options) {
       return JSON.parse(text);
     };
 
+    // --- status -----------------------------------------------------------
+    if (pathname === `${ADMIN_PREFIX}/api/status` && req.method === 'GET') {
+      const state = await grantState();
+      sendJson(res, 200, {
+        ok: true,
+        signedIn: state.signedIn,
+        expiresAt: state.expiresAt,
+        mode: transport.mode,
+        cliVersion: config.claudeCliVersion,
+      });
+      return;
+    }
+
+    // --- quota -----------------------------------------------------------------
     // The subscription's rate-limit windows, as Anthropic reports them.
-    if (pathname === `${ADMIN_PREFIX}/quota` && req.method === 'GET') {
-      const fresh = Date.now() - quotaCache.at < QUOTA_CACHE_MS;
-      if (fresh && quotaCache.usage !== undefined) {
-        sendJson(res, 200, { ok: true, usage: quotaCache.usage, cached: true, at: quotaCache.at });
-        return;
-      }
-      if (fresh && quotaCache.error !== undefined) {
-        // Serve the recent failure rather than re-tripping the limit.
-        sendJson(res, 502, { ...quotaCache.error, cached: true, at: quotaCache.at });
-        return;
-      }
-      try {
-        const usage = await probeUpstream('/api/oauth/usage');
-        quotaCache.at = Date.now();
-        quotaCache.usage = usage;
-        quotaCache.error = undefined;
-        sendJson(res, 200, { ok: true, usage, cached: false, at: quotaCache.at });
-      } catch (error) {
-        const payload = { error: String(error?.message ?? error), detail: error?.upstreamBody };
-        quotaCache.at = Date.now();
-        quotaCache.error = payload;
-        quotaCache.usage = undefined;
-        sendJson(res, 502, payload);
-      }
+    if (pathname === `${ADMIN_PREFIX}/api/quota` && req.method === 'GET') {
+      await api(async () => {
+        const fresh = Date.now() - quotaCache.at < QUOTA_CACHE_MS;
+        if (fresh && quotaCache.usage !== undefined) {
+          sendJson(res, 200, { ok: true, usage: quotaCache.usage, cached: true, at: quotaCache.at });
+          return;
+        }
+        if (fresh && quotaCache.error !== undefined) {
+          // Serve the recent failure rather than re-tripping the limit.
+          sendJson(res, 502, { ...quotaCache.error, cached: true, at: quotaCache.at });
+          return;
+        }
+        try {
+          const usage = await probeUpstream('/api/oauth/usage');
+          quotaCache.at = Date.now();
+          quotaCache.usage = usage;
+          quotaCache.error = undefined;
+          sendJson(res, 200, { ok: true, usage, cached: false, at: quotaCache.at });
+        } catch (error) {
+          const payload = { error: String(error?.message ?? error), detail: error?.upstreamBody };
+          quotaCache.at = Date.now();
+          quotaCache.error = payload;
+          quotaCache.usage = undefined;
+          sendJson(res, 502, payload);
+        }
+      })();
       return;
     }
 
+    // --- models ----------------------------------------------------------------
     // The model catalog this account can actually call.
-    if (pathname === `${ADMIN_PREFIX}/models` && req.method === 'GET') {
-      try {
-        const payload = await probeUpstream('/v1/models?limit=1000');
-        const entries = Array.isArray(payload?.data) ? payload.data : [];
-        sendJson(res, 200, {
-          ok: true,
-          models: entries
-            .filter((entry) => typeof entry?.id === 'string')
-            .map((entry) => ({
-              id: entry.id,
-              displayName:
-                typeof entry.display_name === 'string' && entry.display_name.length > 0
-                  ? entry.display_name
-                  : entry.id,
-            })),
-        });
-      } catch (error) {
-        sendJson(res, 502, { error: String(error?.message ?? error), detail: error?.upstreamBody });
-      }
+    if (pathname === `${ADMIN_PREFIX}/api/models` && req.method === 'GET') {
+      await api(async () => {
+        try {
+          const payload = await probeUpstream('/v1/models?limit=1000');
+          const entries = Array.isArray(payload?.data) ? payload.data : [];
+          sendJson(res, 200, {
+            ok: true,
+            models: entries
+              .filter((entry) => typeof entry?.id === 'string')
+              .map((entry) => ({
+                id: entry.id,
+                displayName:
+                  typeof entry.display_name === 'string' && entry.display_name.length > 0
+                    ? entry.display_name
+                    : entry.id,
+              })),
+          });
+        } catch (error) {
+          sendJson(res, 502, { error: String(error?.message ?? error), detail: error?.upstreamBody });
+        }
+      })();
       return;
     }
 
+    // --- usage -----------------------------------------------------------------
     // Token accounting for relayed model traffic. Read-only and cheap: the
     // ledger is process memory, so this never touches the network and cannot
     // trip a rate limit.
-    if (pathname === `${ADMIN_PREFIX}/usage` && req.method === 'GET') {
+    if (pathname === `${ADMIN_PREFIX}/api/usage` && req.method === 'GET') {
       sendJson(res, 200, { ok: true, ...usageLedger.snapshot() });
       return;
     }
 
-    if (pathname === `${ADMIN_PREFIX}/login/start` && req.method === 'POST') {
+    // --- users -----------------------------------------------------------------
+    if (pathname === `${ADMIN_PREFIX}/api/users` && req.method === 'GET') {
+      await api(async () => {
+        if (users === undefined) {
+          sendJson(res, 501, {
+            error: 'multi-user support is not mounted on this server',
+            code: 'USERS_UNAVAILABLE',
+          });
+          return;
+        }
+        let list;
+        try {
+          list = await users.list();
+        } catch (error) {
+          // The read failure is reportable here: an operator asking for the list
+          // needs to know the file is broken, unlike a relay request which must
+          // keep working with the legacy bearer alone.
+          sendJson(res, 500, {
+            error: String(error?.message ?? error),
+            code: error?.code ?? 'USERS_CORRUPT',
+          });
+          return;
+        }
+        sendJson(res, 200, { ok: true, users: list });
+      })();
+      return;
+    }
+
+    if (pathname === `${ADMIN_PREFIX}/api/users` && req.method === 'POST') {
+      await api(async () => {
+        if (users === undefined) {
+          sendJson(res, 501, { error: 'multi-user support is not mounted on this server', code: 'USERS_UNAVAILABLE' });
+          return;
+        }
+        const payload = await readJson(req, res, 8 * 1024);
+        if (payload === undefined) return;
+        try {
+          const { user, token } = await users.create({ name: payload?.name, role: payload?.role });
+          // The one and only reveal. Nothing is logged with the token in it.
+          sendJson(res, 200, { ok: true, user, token });
+        } catch (error) {
+          if (error instanceof UsersError) {
+            sendJson(res, 400, { error: error.message, code: error.code });
+            return;
+          }
+          logger.warn('could not create a user: %s', String(error?.message ?? error));
+          sendJson(res, 500, { error: 'the user file could not be written', code: 'USERS_WRITE_FAILED' });
+        }
+      })();
+      return;
+    }
+
+    const userRoute = /^\/admin\/api\/users\/([^/]+)$/.exec(pathname);
+    if (userRoute !== null && (req.method === 'PATCH' || req.method === 'DELETE')) {
+      const id = decodeURIComponent(userRoute[1]);
+      await api(async () => {
+        if (users === undefined) {
+          sendJson(res, 501, { error: 'multi-user support is not mounted on this server', code: 'USERS_UNAVAILABLE' });
+          return;
+        }
+        if (req.method === 'PATCH') {
+          const payload = await readJson(req, res, 8 * 1024);
+          if (payload === undefined) return;
+          try {
+            const user = await users.update(id, {
+              name: payload?.name,
+              role: payload?.role,
+              disabled: payload?.disabled,
+            });
+            sendJson(res, 200, { ok: true, user });
+          } catch (error) {
+            const status = error?.code === 'UNKNOWN_USER' ? 404 : 400;
+            sendJson(res, status, { error: error.message, code: error.code });
+          }
+          return;
+        }
+        try {
+          const removed = await users.remove(id);
+          if (!removed) {
+            sendJson(res, 404, { error: 'that user does not exist', code: 'UNKNOWN_USER' });
+            return;
+          }
+          sendJson(res, 200, { ok: true });
+        } catch (error) {
+          sendJson(res, 400, { error: error.message, code: error.code });
+        }
+      })();
+      return;
+    }
+
+    // --- Claude sign-in ----------------------------------------------------
+    if (pathname === `${ADMIN_PREFIX}/api/login/start` && req.method === 'POST') {
       try {
         const attempt = sessions.create();
         sendJson(res, 200, { id: attempt.id, url: attempt.url, expiresAt: attempt.expiresAt });
@@ -307,49 +519,46 @@ export function createServer(options) {
       return;
     }
 
-    if (pathname === `${ADMIN_PREFIX}/login/complete` && req.method === 'POST') {
-      let payload;
-      try {
-        payload = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8') || '{}');
-      } catch {
-        sendJson(res, 400, { error: 'the request body must be JSON', code: 'BAD_BODY' });
-        return;
-      }
-      let attempt;
-      try {
-        attempt = sessions.peek(payload?.id);
-      } catch (error) {
-        sendJson(res, 404, { error: error.message, code: error.code });
-        return;
-      }
-      let parsed;
-      try {
-        parsed = parseAuthorizationInput(payload?.code);
-      } catch (error) {
-        sendJson(res, 400, { error: error.message, code: 'BAD_CODE' });
-        return;
-      }
-      if (parsed.state !== undefined && parsed.state !== attempt.verifier) {
-        sendJson(res, 400, {
-          error: 'the pasted code belongs to a different sign-in attempt',
-          code: 'STATE_MISMATCH',
-        });
-        return;
-      }
-      try {
-        const grant = await exchangeCode(parsed.code, attempt.verifier, transport.fetch);
-        await grants.write(grant);
-        sessions.consume(payload.id);
-        logger.info('stored a new Claude subscription grant (console)');
-        sendJson(res, 200, { ok: true, expiresAt: grant.expires });
-      } catch (error) {
-        logger.warn('the console authorization-code exchange failed: %s', String(error));
-        sendJson(res, 502, { error: String(error?.message ?? error), code: 'EXCHANGE_FAILED' });
-      }
+    if (pathname === `${ADMIN_PREFIX}/api/login/complete` && req.method === 'POST') {
+      await api(async () => {
+        const payload = await readJson(req, res, 64 * 1024);
+        if (payload === undefined) return;
+        let attempt;
+        try {
+          attempt = sessions.peek(payload?.id);
+        } catch (error) {
+          sendJson(res, 404, { error: error.message, code: error.code });
+          return;
+        }
+        let parsed;
+        try {
+          parsed = parseAuthorizationInput(payload?.code);
+        } catch (error) {
+          sendJson(res, 400, { error: error.message, code: 'BAD_CODE' });
+          return;
+        }
+        if (parsed.state !== undefined && parsed.state !== attempt.verifier) {
+          sendJson(res, 400, {
+            error: 'the pasted code belongs to a different sign-in attempt',
+            code: 'STATE_MISMATCH',
+          });
+          return;
+        }
+        try {
+          const grant = await exchangeCode(parsed.code, attempt.verifier, transport.fetch);
+          await grants.write(grant);
+          sessions.consume(payload.id);
+          logger.info('stored a new Claude subscription grant (console)');
+          sendJson(res, 200, { ok: true, expiresAt: grant.expires });
+        } catch (error) {
+          logger.warn('the console authorization-code exchange failed: %s', String(error));
+          sendJson(res, 502, { error: String(error?.message ?? error), code: 'EXCHANGE_FAILED' });
+        }
+      })();
       return;
     }
 
-    if (pathname === `${ADMIN_PREFIX}/login/cancel` && req.method === 'POST') {
+    if (pathname === `${ADMIN_PREFIX}/api/login/cancel` && req.method === 'POST') {
       try {
         const payload = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8') || '{}');
         sessions.consume(payload?.id);
@@ -360,6 +569,12 @@ export function createServer(options) {
       return;
     }
 
+    if (pathname.startsWith(`${ADMIN_PREFIX}/api/`)) {
+      sendJson(res, 404, { error: 'unknown console api route' });
+      return;
+    }
+
+    // A console page path that is not one of the five, or a non-GET on one.
     sendJson(res, 404, { error: 'unknown console route' });
   };
 
@@ -390,7 +605,14 @@ export function createServer(options) {
         return;
       }
 
-      if (!auth.check(req.headers.authorization)) {
+      // Root-level routes: the relay needs any live user; the grant-mutating
+      // login routes need an admin, because they can replace the credential the
+      // whole deployment depends on.
+      const isLoginRoute = pathname.startsWith('/login/');
+      const identity = isLoginRoute
+        ? await auth.checkAdmin(req.headers.authorization)
+        : await auth.checkUser(req.headers.authorization);
+      if (identity === undefined) {
         // Refuse before touching the upstream or the grant.
         sendJson(res, 401, { error: 'unauthorized' });
         return;
@@ -488,6 +710,8 @@ export function createServer(options) {
     // Exposed so a caller can read the accounting in-process: the console route
     // covers the HTTP path, and tests need the same numbers without a session.
     usage: usageLedger,
+    // Exposed for the same reason: tests drive the directory through the server.
+    users,
     async dispose() {
       await new Promise((resolve) => server.close(() => resolve()));
     },
