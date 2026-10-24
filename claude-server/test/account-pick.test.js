@@ -281,8 +281,15 @@ describe('the quota endpoint accepts the operator bearer', () => {
     assert.ok(body.accounts.length >= 2, 'every subscription must be represented');
     for (const row of body.accounts) {
       assert.ok(typeof row.accountId === 'string');
-      assert.ok(Array.isArray(row.windows), 'each row carries its own windows');
+      // The server passes the upstream usage payload through rather than
+      // reinterpreting it; mapping it onto renderable windows is the consumer's
+      // job, so this asserts the raw payload is present and distinct per account.
+      assert.ok(row.usage !== undefined, 'each row carries its own usage payload');
+      assert.ok(Array.isArray(row.usage.limits), 'the modern limits array survives');
     }
+    // Distinct accounts must not share one payload.
+    const readings = body.accounts.map((row) => JSON.stringify(row.usage));
+    assert.equal(new Set(readings).size, body.accounts.length, 'no account may borrow another\'s figures');
   });
 
   it('still refuses a request carrying neither cookie nor bearer', async () => {

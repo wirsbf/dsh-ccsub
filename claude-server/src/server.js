@@ -566,6 +566,49 @@ export function createServer(options) {
       return;
     }
 
+
+    /**
+     * Read one upstream endpoint with one account's credentials.
+     * @param path - the upstream path.
+     * @param accountId - the account to spend; null means the default account.
+     */
+    const probeUpstream = async (path, accountId = null) => {
+      // `ctx.hosts` is how an embedder points this server at a different
+      // origin; omitting it here made every quota probe bypass the injected
+      // host and reach the real API even in tests.
+      const target = upstreamFor(path, '', hosts ?? {});
+      const token = await accessToken(accountId);
+      const headers = withClaudeIdentity(
+        { accept: 'application/json', 'anthropic-version': '2023-06-01' },
+        config.claudeCliVersion,
+        config.stainlessRuntimeVersion,
+      );
+      headers.set('authorization', `Bearer ${token}`);
+      ensureBaseBetas(headers);
+      headers.delete('host');
+      const response = await transport.request(target, {
+        method: 'GET',
+        headers: Object.fromEntries(headers.entries()),
+      });
+      const chunks = [];
+      for await (const chunk of response.body) chunks.push(chunk);
+      const text = Buffer.concat(chunks).toString('utf8');
+      // Log the outcome: a console probe that trips the usage limit is otherwise
+      // invisible, and the only way to learn about it is to watch the panel fail.
+      logger.info(
+        'console probe GET %s -> %d%s',
+        path,
+        response.statusCode,
+        typeof response.headers['request-id'] === 'string' ? ` request-id=${response.headers['request-id']}` : '',
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        const error = new Error(`the upstream answered ${response.statusCode}`);
+        error.upstreamBody = text.slice(0, 300);
+        throw error;
+      }
+      return JSON.parse(text);
+    };
+
     if (pathname === `${ADMIN_PREFIX}/api/quota` && req.method === 'GET') {
       // The console reaches this with its cookie; a remote plugin holds only the
       // operator bearer, and asking it to keep a console session alive would mean
@@ -674,48 +717,6 @@ export function createServer(options) {
      * @param path - the upstream path.
      * @returns the parsed JSON body.
      */
-    /**
-     * Read one upstream endpoint with one account's credentials.
-     * @param path - the upstream path.
-     * @param accountId - the account to spend; null means the default account.
-     */
-    const probeUpstream = async (path, accountId = null) => {
-      // `ctx.hosts` is how an embedder points this server at a different
-      // origin; omitting it here made every quota probe bypass the injected
-      // host and reach the real API even in tests.
-      const target = upstreamFor(path, '', hosts ?? {});
-      const token = await accessToken(accountId);
-      const headers = withClaudeIdentity(
-        { accept: 'application/json', 'anthropic-version': '2023-06-01' },
-        config.claudeCliVersion,
-        config.stainlessRuntimeVersion,
-      );
-      headers.set('authorization', `Bearer ${token}`);
-      ensureBaseBetas(headers);
-      headers.delete('host');
-      const response = await transport.request(target, {
-        method: 'GET',
-        headers: Object.fromEntries(headers.entries()),
-      });
-      const chunks = [];
-      for await (const chunk of response.body) chunks.push(chunk);
-      const text = Buffer.concat(chunks).toString('utf8');
-      // Log the outcome: a console probe that trips the usage limit is otherwise
-      // invisible, and the only way to learn about it is to watch the panel fail.
-      logger.info(
-        'console probe GET %s -> %d%s',
-        path,
-        response.statusCode,
-        typeof response.headers['request-id'] === 'string' ? ` request-id=${response.headers['request-id']}` : '',
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        const error = new Error(`the upstream answered ${response.statusCode}`);
-        error.upstreamBody = text.slice(0, 300);
-        throw error;
-      }
-      return JSON.parse(text);
-    };
-
     // --- status -----------------------------------------------------------
     if (pathname === `${ADMIN_PREFIX}/api/status` && req.method === 'GET') {
       const state = await grantState(null);
@@ -735,6 +736,7 @@ export function createServer(options) {
     // account is returned so the console and the plugin can show them side by
     // side instead of presenting one account's numbers as if they were the
     // deployment's.
+
 
     // --- models ----------------------------------------------------------------
     // The model catalog this account can actually call.

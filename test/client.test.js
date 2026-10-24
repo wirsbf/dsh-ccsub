@@ -735,3 +735,81 @@ test('every class used in the markup has a rule in the injected stylesheet', asy
   const unused = [...styled].filter((name) => !used.has(name));
   assert.deepEqual(unused, [], `CSS rules never used in markup: ${unused.join(', ')}`);
 });
+
+test('a connected card with several subscriptions renders one block each', async (t) => {
+  // This is the branch that blanked the whole panel: `spentAccount` was read
+  // without being declared, so the slot threw and the section rendered empty. A
+  // signed-out fixture never reaches it, which is why every earlier render
+  // passed while the real page went white.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody({
+      mode: 'claude-server',
+      grant: { configured: false },
+      claudeServer: {
+        url: 'https://claude.example',
+        valid: true,
+        bearerConfigured: true,
+        bearerRecord: 'claude-server',
+        account: '',
+        accounts: [
+          {
+            accountId: 'default',
+            name: 'Default account',
+            quotaLimit: null,
+            windows: [{ kind: 'session', usedPercent: 70, resetsAt: Date.now() + 3_600_000 }],
+          },
+          {
+            accountId: 'acct_second',
+            name: 'claude1',
+            quotaLimit: 60,
+            windows: [{ kind: 'session', usedPercent: 5, resetsAt: Date.now() + 3_600_000 }],
+          },
+        ],
+      },
+      proxy: { active: false, valid: false, url: '', allow: [], requireEgressCheck: true },
+    }),
+    [`${API}/quota`]: { windows: [] },
+  });
+
+  const { elements } = await settle(components[0], { t: copy });
+  assert.equal(byClass(elements, 'ccsub-account-block').length, 2, 'one block per subscription');
+  assert.equal(byClass(elements, 'ccsub-account-pick').length, 1, 'the account picker is offered');
+});
+
+test('a connected card still renders an account whose quota probe failed', async (t) => {
+  // A deployment can list an account whose probe failed. The block must render
+  // and say so rather than throwing or dropping the account silently.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody({
+      mode: 'claude-server',
+      grant: { configured: false },
+      claudeServer: {
+        url: 'https://claude.example',
+        valid: true,
+        bearerConfigured: true,
+        bearerRecord: 'claude-server',
+        account: 'acct_second',
+        accounts: [
+          {
+            accountId: 'acct_second',
+            name: 'claude1',
+            quotaLimit: null,
+            windows: [],
+            error: 'probe failed',
+          },
+        ],
+      },
+      proxy: { active: false, valid: false, url: '', allow: [], requireEgressCheck: true },
+    }),
+    [`${API}/quota`]: { windows: [] },
+  });
+
+  const { elements } = await settle(components[0], { t: copy });
+  assert.equal(byClass(elements, 'ccsub-account-block').length, 1, 'the account is still listed');
+});
