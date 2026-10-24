@@ -566,84 +566,17 @@ export function createServer(options) {
       return;
     }
 
-    // Everything below mutates or reveals credential state.
-    if (!signedIn) {
-      sendJson(res, 401, { error: 'the console session is missing or expired; unlock again' });
-      return;
-    }
-
-    /**
-     * Read one Anthropic endpoint through the transport the relay uses.
-     *
-     * The console must not reach upstream by a second path: a probe that
-     * bypassed the proxy would report numbers for an egress the relay never
-     * uses, and would expose the real address. So the request is built the same
-     * way `relay()` builds one, minus the body.
-     * @param path - the upstream path.
-     * @returns the parsed JSON body.
-     */
-    /**
-     * Read one upstream endpoint with one account's credentials.
-     * @param path - the upstream path.
-     * @param accountId - the account to spend; null means the default account.
-     */
-    const probeUpstream = async (path, accountId = null) => {
-      // `ctx.hosts` is how an embedder points this server at a different
-      // origin; omitting it here made every quota probe bypass the injected
-      // host and reach the real API even in tests.
-      const target = upstreamFor(path, '', hosts ?? {});
-      const token = await accessToken(accountId);
-      const headers = withClaudeIdentity(
-        { accept: 'application/json', 'anthropic-version': '2023-06-01' },
-        config.claudeCliVersion,
-        config.stainlessRuntimeVersion,
-      );
-      headers.set('authorization', `Bearer ${token}`);
-      ensureBaseBetas(headers);
-      headers.delete('host');
-      const response = await transport.request(target, {
-        method: 'GET',
-        headers: Object.fromEntries(headers.entries()),
-      });
-      const chunks = [];
-      for await (const chunk of response.body) chunks.push(chunk);
-      const text = Buffer.concat(chunks).toString('utf8');
-      // Log the outcome: a console probe that trips the usage limit is otherwise
-      // invisible, and the only way to learn about it is to watch the panel fail.
-      logger.info(
-        'console probe GET %s -> %d%s',
-        path,
-        response.statusCode,
-        typeof response.headers['request-id'] === 'string' ? ` request-id=${response.headers['request-id']}` : '',
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        const error = new Error(`the upstream answered ${response.statusCode}`);
-        error.upstreamBody = text.slice(0, 300);
-        throw error;
-      }
-      return JSON.parse(text);
-    };
-
-    // --- status -----------------------------------------------------------
-    if (pathname === `${ADMIN_PREFIX}/api/status` && req.method === 'GET') {
-      const state = await grantState(null);
-      sendJson(res, 200, {
-        ok: true,
-        signedIn: state.signedIn,
-        expiresAt: state.expiresAt,
-        mode: transport.mode,
-        cliVersion: config.claudeCliVersion,
-      });
-      return;
-    }
-
-    // --- quota -----------------------------------------------------------------
-    // The subscription's rate-limit windows, as Anthropic reports them.
-    // `?account=<id>` reads one subscription; without it, every signed-in
-    // account is returned so the console and the plugin can show them side by
-    // side instead of presenting one account's numbers as if they were the
-    // deployment's.
     if (pathname === `${ADMIN_PREFIX}/api/quota` && req.method === 'GET') {
+      // The console reaches this with its cookie; a remote plugin holds only the
+      // operator bearer, and asking it to keep a console session alive would mean
+      // a second credential to maintain. Either proof is accepted.
+      if (!signedIn && (await auth.checkAdmin(req.headers.authorization)) === undefined) {
+        sendJson(res, 401, {
+          error: 'this endpoint needs the console session or the operator bearer',
+          code: 'UNAUTHORIZED',
+        });
+        return;
+      }
       await api(async () => {
         const usageFor = async (accountId) => {
           const slot = quotaSlot(accountId);
@@ -724,6 +657,84 @@ export function createServer(options) {
       })();
       return;
     }
+
+    // Everything below mutates or reveals credential state.
+    if (!signedIn) {
+      sendJson(res, 401, { error: 'the console session is missing or expired; unlock again' });
+      return;
+    }
+
+    /**
+     * Read one Anthropic endpoint through the transport the relay uses.
+     *
+     * The console must not reach upstream by a second path: a probe that
+     * bypassed the proxy would report numbers for an egress the relay never
+     * uses, and would expose the real address. So the request is built the same
+     * way `relay()` builds one, minus the body.
+     * @param path - the upstream path.
+     * @returns the parsed JSON body.
+     */
+    /**
+     * Read one upstream endpoint with one account's credentials.
+     * @param path - the upstream path.
+     * @param accountId - the account to spend; null means the default account.
+     */
+    const probeUpstream = async (path, accountId = null) => {
+      // `ctx.hosts` is how an embedder points this server at a different
+      // origin; omitting it here made every quota probe bypass the injected
+      // host and reach the real API even in tests.
+      const target = upstreamFor(path, '', hosts ?? {});
+      const token = await accessToken(accountId);
+      const headers = withClaudeIdentity(
+        { accept: 'application/json', 'anthropic-version': '2023-06-01' },
+        config.claudeCliVersion,
+        config.stainlessRuntimeVersion,
+      );
+      headers.set('authorization', `Bearer ${token}`);
+      ensureBaseBetas(headers);
+      headers.delete('host');
+      const response = await transport.request(target, {
+        method: 'GET',
+        headers: Object.fromEntries(headers.entries()),
+      });
+      const chunks = [];
+      for await (const chunk of response.body) chunks.push(chunk);
+      const text = Buffer.concat(chunks).toString('utf8');
+      // Log the outcome: a console probe that trips the usage limit is otherwise
+      // invisible, and the only way to learn about it is to watch the panel fail.
+      logger.info(
+        'console probe GET %s -> %d%s',
+        path,
+        response.statusCode,
+        typeof response.headers['request-id'] === 'string' ? ` request-id=${response.headers['request-id']}` : '',
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        const error = new Error(`the upstream answered ${response.statusCode}`);
+        error.upstreamBody = text.slice(0, 300);
+        throw error;
+      }
+      return JSON.parse(text);
+    };
+
+    // --- status -----------------------------------------------------------
+    if (pathname === `${ADMIN_PREFIX}/api/status` && req.method === 'GET') {
+      const state = await grantState(null);
+      sendJson(res, 200, {
+        ok: true,
+        signedIn: state.signedIn,
+        expiresAt: state.expiresAt,
+        mode: transport.mode,
+        cliVersion: config.claudeCliVersion,
+      });
+      return;
+    }
+
+    // --- quota -----------------------------------------------------------------
+    // The subscription's rate-limit windows, as Anthropic reports them.
+    // `?account=<id>` reads one subscription; without it, every signed-in
+    // account is returned so the console and the plugin can show them side by
+    // side instead of presenting one account's numbers as if they were the
+    // deployment's.
 
     // --- models ----------------------------------------------------------------
     // The model catalog this account can actually call.

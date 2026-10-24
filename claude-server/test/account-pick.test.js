@@ -184,3 +184,110 @@ describe('naming an account per request', () => {
     }
   });
 });
+
+describe('the quota endpoint accepts the operator bearer', () => {
+  // A remote plugin holds a bearer, not a console cookie. Requiring a cookie
+  // here would mean the panel could never show per-account quota, which is the
+  // only reason the endpoint returns several accounts.
+  let dir;
+  let accounts;
+  let users;
+  let server;
+  let transport;
+  let upstream;
+  let adminToken;
+
+  before(async () => {
+    upstream = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        if (String(req.url).includes('/api/oauth/usage')) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              limits: [
+                { kind: 'session', percent: 42, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+              ],
+            }),
+          );
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+    });
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    const upstreamOrigin = `http://127.0.0.1:${upstream.address().port}`;
+
+    dir = await mkdtemp(join(tmpdir(), 'claude-quota-'));
+    await mkdir(join(dir, 'accounts'), { recursive: true });
+    const grantPath = join(dir, 'grant.json');
+    accounts = new AccountDirectory({
+      path: join(dir, 'accounts.json'),
+      grantsDir: join(dir, 'accounts'),
+      legacyGrantPath: grantPath,
+      logger: quiet,
+    });
+    await accounts.store(null).write({ type: 'oauth', access: 'token-default', refresh: 'r', expires: Date.now() + 86_400_000 });
+    const second = await accounts.create({ name: 'second' });
+    await accounts.store(second.id).write({ type: 'oauth', access: 'token-2', refresh: 'r', expires: Date.now() + 86_400_000 });
+
+    users = new UserDirectory({ path: join(dir, 'users.json'), logger: quiet });
+    adminToken = await users.create({ name: 'ops', role: 'admin' });
+
+    transport = new Transport({ mode: 'direct' });
+    server = createServer({
+      config: {
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        mode: 'direct',
+        grantPath,
+        accountsPath: join(dir, 'accounts.json'),
+        grantsDir: join(dir, 'accounts'),
+        clientBearer: 'sk-ant-oat01-a-long-enough-test-bearer',
+        claudeCliVersion: '2.1.303',
+        stainlessRuntimeVersion: 'v22.19.0',
+        refreshSkewMs: 1000,
+        loginTtlMs: 60_000,
+        sanitizeBody: false,
+        logLevel: 'error',
+        maxBodyBytes: 1_048_576,
+      },
+      transport,
+      accounts,
+      users,
+      logger: quiet,
+      hosts: { apiHost: upstreamOrigin, platformHost: upstreamOrigin },
+    });
+    await new Promise((resolve) => server.server.listen(0, '127.0.0.1', resolve));
+  });
+
+  after(async () => {
+    await server.dispose();
+    await transport.dispose();
+    await new Promise((resolve) => upstream.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('answers a bearer with every account', async () => {
+    const origin = `http://127.0.0.1:${server.server.address().port}`;
+    const response = await fetch(`${origin}/admin/api/quota`, {
+      headers: { authorization: `Bearer ${adminToken.token}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.ok(Array.isArray(body.accounts), 'the payload must carry per-account rows');
+    assert.ok(body.accounts.length >= 2, 'every subscription must be represented');
+    for (const row of body.accounts) {
+      assert.ok(typeof row.accountId === 'string');
+      assert.ok(Array.isArray(row.windows), 'each row carries its own windows');
+    }
+  });
+
+  it('still refuses a request carrying neither cookie nor bearer', async () => {
+    const origin = `http://127.0.0.1:${server.server.address().port}`;
+    const response = await fetch(`${origin}/admin/api/quota`);
+    assert.equal(response.status, 401);
+  });
+});
