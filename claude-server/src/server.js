@@ -172,7 +172,25 @@ export function createServer(options) {
    * routing state out of the grant volume.
    */
   const bindings = new SessionBindings();
-  const quotaCache = { at: 0, usage: undefined, error: undefined };
+  /**
+   * Quota probe results, keyed per account.
+   *
+   * One cache entry per account rather than one global: with several
+   * subscriptions, a single slot would let one account's figures overwrite
+   * another's, and the console would show the wrong quota beside the wrong
+   * name.
+   */
+  const quotaCache = new Map();
+  /** The cache entry for one account, created on first use. */
+  const quotaSlot = (accountId) => {
+    const key = accountId ?? DEFAULT_ACCOUNT_ID;
+    let slot = quotaCache.get(key);
+    if (slot === undefined) {
+      slot = { at: 0, usage: undefined, error: undefined };
+      quotaCache.set(key, slot);
+    }
+    return slot;
+  };
   const QUOTA_CACHE_MS = 5 * 60_000;
   const maxBodyBytes = config.maxBodyBytes ?? 32 * 1024 * 1024;
 
@@ -397,7 +415,7 @@ export function createServer(options) {
    * grants nothing.
    */
   const admin = async (req, res, ctx) => {
-    const { pathname } = ctx;
+    const { pathname, url } = ctx;
     const sessionId = cookieOf(req.headers.cookie, ADMIN_COOKIE);
     const signedIn = adminSessions.valid(sessionId);
     const identity = signedIn ? adminSessions.identityOf(sessionId) : undefined;
@@ -527,9 +545,17 @@ export function createServer(options) {
      * @param path - the upstream path.
      * @returns the parsed JSON body.
      */
-    const probeUpstream = async (path) => {
-      const target = upstreamFor(path, '');
-      const token = await accessToken();
+    /**
+     * Read one upstream endpoint with one account's credentials.
+     * @param path - the upstream path.
+     * @param accountId - the account to spend; null means the default account.
+     */
+    const probeUpstream = async (path, accountId = null) => {
+      // `ctx.hosts` is how an embedder points this server at a different
+      // origin; omitting it here made every quota probe bypass the injected
+      // host and reach the real API even in tests.
+      const target = upstreamFor(path, '', hosts ?? {});
+      const token = await accessToken(accountId);
       const headers = withClaudeIdentity(
         { accept: 'application/json', 'anthropic-version': '2023-06-01' },
         config.claudeCliVersion,
@@ -576,31 +602,88 @@ export function createServer(options) {
 
     // --- quota -----------------------------------------------------------------
     // The subscription's rate-limit windows, as Anthropic reports them.
+    // `?account=<id>` reads one subscription; without it, every signed-in
+    // account is returned so the console and the plugin can show them side by
+    // side instead of presenting one account's numbers as if they were the
+    // deployment's.
     if (pathname === `${ADMIN_PREFIX}/api/quota` && req.method === 'GET') {
       await api(async () => {
-        const fresh = Date.now() - quotaCache.at < QUOTA_CACHE_MS;
-        if (fresh && quotaCache.usage !== undefined) {
-          sendJson(res, 200, { ok: true, usage: quotaCache.usage, cached: true, at: quotaCache.at });
+        const usageFor = async (accountId) => {
+          const slot = quotaSlot(accountId);
+          const fresh = Date.now() - slot.at < QUOTA_CACHE_MS;
+          if (fresh && slot.usage !== undefined) {
+            return { usage: slot.usage, cached: true, at: slot.at };
+          }
+          if (fresh && slot.error !== undefined) {
+            // Serve the recent failure rather than re-tripping the limit.
+            throw Object.assign(new Error(slot.error.error), { cached: true, at: slot.at });
+          }
+          const usage = await probeUpstream('/api/oauth/usage', accountId);
+          slot.at = Date.now();
+          slot.usage = usage;
+          slot.error = undefined;
+          return { usage, cached: false, at: slot.at };
+        };
+
+        const requested = url.searchParams.get('account');
+        if (requested !== null && requested !== '') {
+          try {
+            const result = await usageFor(requested);
+            sendJson(res, 200, { ok: true, accountId: requested, ...result });
+          } catch (error) {
+            const payload = { error: String(error?.message ?? error), detail: error?.upstreamBody };
+            const slot = quotaSlot(requested);
+            slot.at = Date.now();
+            slot.error = payload;
+            slot.usage = undefined;
+            sendJson(res, 502, payload);
+          }
           return;
         }
-        if (fresh && quotaCache.error !== undefined) {
-          // Serve the recent failure rather than re-tripping the limit.
-          sendJson(res, 502, { ...quotaCache.error, cached: true, at: quotaCache.at });
-          return;
+
+        // All accounts: one entry per account, failures included per account so
+        // one broken subscription does not blank the whole panel.
+        const rows = accounts === undefined ? [] : await accounts.list().catch(() => []);
+        const targets = rows.length === 0
+          ? [{ id: DEFAULT_ACCOUNT_ID, name: 'Default account', signedIn: true, default: true }]
+          : rows;
+        const out = [];
+        for (const row of targets) {
+          if (row.signedIn !== true || row.disabled === true) {
+            out.push({
+              accountId: row.id,
+              name: row.name,
+              signedIn: false,
+              windows: [],
+              error: row.disabled === true ? 'account is disabled' : 'account is signed out',
+            });
+            continue;
+          }
+          try {
+            const result = await usageFor(row.id);
+            out.push({
+              accountId: row.id,
+              name: row.name,
+              signedIn: true,
+              // The raw payload is passed through: this server does not
+              // interpret quota shapes, and the consumers (console script,
+              // plugin) already know how to read both the modern `limits`
+              // array and the legacy `five_hour`/`seven_day` buckets.
+              usage: result.usage,
+              cached: result.cached,
+              at: result.at,
+            });
+          } catch (error) {
+            out.push({
+              accountId: row.id,
+              name: row.name,
+              signedIn: true,
+              windows: [],
+              error: String(error?.message ?? error),
+            });
+          }
         }
-        try {
-          const usage = await probeUpstream('/api/oauth/usage');
-          quotaCache.at = Date.now();
-          quotaCache.usage = usage;
-          quotaCache.error = undefined;
-          sendJson(res, 200, { ok: true, usage, cached: false, at: quotaCache.at });
-        } catch (error) {
-          const payload = { error: String(error?.message ?? error), detail: error?.upstreamBody };
-          quotaCache.at = Date.now();
-          quotaCache.error = payload;
-          quotaCache.usage = undefined;
-          sendJson(res, 502, payload);
-        }
+        sendJson(res, 200, { ok: true, accounts: out });
       })();
       return;
     }
@@ -764,7 +847,10 @@ export function createServer(options) {
         const payload = await readJson(req, res, 16 * 1024);
         if (payload === undefined) return;
         try {
-          const account = await accounts.create({ name: payload?.name });
+          const account = await accounts.create({
+            name: payload?.name,
+            quotaLimit: payload?.quotaLimit,
+          });
           sendJson(res, 201, { ok: true, account });
         } catch (error) {
           sendJson(res, 400, { error: error.message, code: error.code });

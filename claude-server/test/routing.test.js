@@ -266,3 +266,118 @@ describe('pricing', () => {
     assert.equal(formatUsd(1.5), '$1.50');
   });
 });
+
+describe('local quota limits', () => {
+  /** A five-hour window with the given usage percent. */
+  const usage = (percent) => ({
+    limits: [
+      { kind: 'session', percent, resets_at: new Date(Date.now() + 3_600_000).toISOString() },
+    ],
+  });
+
+  it('turns a ceiling into usable room, not raw headroom', () => {
+    // A ceiling of 60% with 40% spent leaves 20 points of usable room, not 60.
+    // Without this an account deliberately held back would still look like the
+    // roomiest one and take every new conversation.
+    const accounts = [
+      { id: 'capped', signedIn: true, disabled: false, quotaLimit: 60 },
+      { id: 'open', signedIn: true, disabled: false, quotaLimit: null },
+    ];
+    const headroom = { capped: sessionHeadroom(usage(40)), open: sessionHeadroom(usage(40)) };
+    // Both are 60% free by the subscription's own accounting, but the capped
+    // account may only fill 20 more points.
+    assert.deepEqual(rankForNewSession(accounts, (id) => headroom[id]), ['open', 'capped']);
+  });
+
+  it('ranks a capped-out account below an unlimited one', () => {
+    // At its ceiling the capped account has zero usable room and must not be
+    // chosen while any alternative exists.
+    const accounts = [
+      { id: 'capped', signedIn: true, disabled: false, quotaLimit: 50 },
+      { id: 'open', signedIn: true, disabled: false, quotaLimit: null },
+    ];
+    const headroom = { capped: sessionHeadroom(usage(70)), open: sessionHeadroom(usage(70)) };
+    assert.deepEqual(rankForNewSession(accounts, (id) => headroom[id]), ['open', 'capped']);
+  });
+
+  it('still prefers an uncapped account with more room', () => {
+    const accounts = [
+      { id: 'busy', signedIn: true, disabled: false, quotaLimit: null },
+      { id: 'idle', signedIn: true, disabled: false, quotaLimit: null },
+    ];
+    const headroom = { busy: sessionHeadroom(usage(80)), idle: sessionHeadroom(usage(10)) };
+    assert.deepEqual(rankForNewSession(accounts, (id) => headroom[id]), ['idle', 'busy']);
+  });
+});
+
+describe('account quota limits', () => {
+  const quiet = { info() {}, warn() {}, error() {} };
+
+  /** A scratch directory with a live account directory. */
+  async function makeDir() {
+    const { mkdtemp, mkdir } = await import('node:fs/promises');
+    const dir = await mkdtemp(join(tmpdir(), 'claude-limit-'));
+    await mkdir(join(dir, 'accounts'), { recursive: true });
+    const directory = new AccountDirectory({
+      path: join(dir, 'accounts.json'),
+      grantsDir: join(dir, 'accounts'),
+      legacyGrantPath: join(dir, 'grant.json'),
+      logger: quiet,
+    });
+    return { dir, directory, close: async () => await rm(dir, { recursive: true, force: true }) };
+  }
+
+  it('round-trips a limit through the file', async () => {
+    const made = await makeDir();
+    try {
+      const created = await made.directory.create({ name: 'Capped', quotaLimit: 60 });
+      assert.equal(created.quotaLimit, 60);
+      const reopened = new AccountDirectory({
+        path: join(made.dir, 'accounts.json'),
+        grantsDir: join(made.dir, 'accounts'),
+        legacyGrantPath: join(made.dir, 'grant.json'),
+        logger: quiet,
+      });
+      const found = (await reopened.list()).find((row) => row.id === created.id);
+      assert.equal(found.quotaLimit, 60);
+    } finally {
+      await made.close();
+    }
+  });
+
+  it('defaults to no limit', async () => {
+    const made = await makeDir();
+    try {
+      const created = await made.directory.create({ name: 'Plain' });
+      assert.equal(created.quotaLimit, null);
+    } finally {
+      await made.close();
+    }
+  });
+
+  it('can clear a limit', async () => {
+    const made = await makeDir();
+    try {
+      const created = await made.directory.create({ name: 'Was capped', quotaLimit: 40 });
+      const updated = await made.directory.update(created.id, { quotaLimit: null });
+      assert.equal(updated.quotaLimit, null);
+    } finally {
+      await made.close();
+    }
+  });
+
+  it('refuses a limit outside 1..100', async () => {
+    const made = await makeDir();
+    try {
+      for (const bad of [0, -1, 101, Number.NaN]) {
+        await assert.rejects(
+          made.directory.create({ name: 'Bad', quotaLimit: bad }),
+          { code: 'ACCOUNTS_CORRUPT' },
+          `limit ${bad} must be refused`,
+        );
+      }
+    } finally {
+      await made.close();
+    }
+  });
+});

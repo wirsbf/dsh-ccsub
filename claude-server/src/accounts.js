@@ -84,7 +84,7 @@ function normalizeStoredAccount(record, index) {
   if (record === null || typeof record !== 'object') {
     throw new AccountsError(`accounts.json entry ${index} is not an object`, 'ACCOUNTS_CORRUPT');
   }
-  const { id, name, createdAt, lastUsedAt, disabled } = record;
+  const { id, name, createdAt, lastUsedAt, disabled, quotaLimit } = record;
   if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
     throw new AccountsError(`accounts.json entry ${index} has no usable id`, 'ACCOUNTS_CORRUPT');
   }
@@ -102,7 +102,32 @@ function normalizeStoredAccount(record, index) {
     createdAt: typeof createdAt === 'number' ? createdAt : 0,
     lastUsedAt: typeof lastUsedAt === 'number' ? lastUsedAt : null,
     disabled: disabled === true,
+    // A local ceiling this deployment will not route past, expressed as the
+    // percent of the five-hour window it is allowed to fill. `null` means "use
+    // the whole subscription". It exists so one account can be held back as a
+    // reserve instead of being drained in parallel with the others.
+    quotaLimit: normalizeQuotaLimit(quotaLimit),
   };
+}
+
+/**
+ * Validate a local quota ceiling.
+ *
+ * A number in 1..100 is the percent of the five-hour window this deployment may
+ * use; `null`/absent means no local ceiling. Zero is rejected rather than read
+ * as "unlimited" — a limit of zero is almost certainly a typo, and silently
+ * meaning the opposite of what it says is the worse failure.
+ * @param raw - the stored value.
+ * @returns the limit, or null.
+ * @throws {AccountsError} `ACCOUNTS_CORRUPT` for an unusable value in the file.
+ */
+function normalizeQuotaLimit(raw) {
+  if (raw === undefined || raw === null) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0 || value > 100) {
+    throw new AccountsError('a quota limit must be a percentage in 1..100', 'ACCOUNTS_CORRUPT');
+  }
+  return value;
 }
 
 /** The public view of an account: what the console renders. */
@@ -113,6 +138,7 @@ function publicAccount(account) {
     createdAt: account.createdAt,
     lastUsedAt: account.lastUsedAt,
     disabled: account.disabled === true,
+    quotaLimit: account.quotaLimit ?? null,
     default: account.id === DEFAULT_ACCOUNT_ID,
   };
 }
@@ -363,9 +389,17 @@ export class AccountDirectory {
    * @param options - `name`.
    * @returns the public account.
    */
-  async create({ name } = {}) {
+  async create({ name, quotaLimit } = {}) {
     const cleanName = normalizeName(name);
-    const created = { id: '', name: cleanName, createdAt: Date.now(), lastUsedAt: null, disabled: false };
+    const cleanLimit = normalizeQuotaLimit(quotaLimit ?? undefined);
+    const created = {
+      id: '',
+      name: cleanName,
+      createdAt: Date.now(),
+      lastUsedAt: null,
+      disabled: false,
+      quotaLimit: cleanLimit,
+    };
     await this.#mutate((directory) => {
       do {
         created.id = `acct_${randomBytes(5).toString('hex')}`;
@@ -395,6 +429,8 @@ export class AccountDirectory {
     }
     const nextName = patch.name === undefined ? undefined : normalizeName(patch.name);
     const nextDisabled = patch.disabled === undefined ? undefined : patch.disabled === true;
+    const nextLimit =
+      patch.quotaLimit === undefined ? undefined : normalizeQuotaLimit(patch.quotaLimit);
     return await this.#mutate((directory) => {
       const account = directory.accounts.find((candidate) => candidate.id === key);
       if (account === undefined) {
@@ -402,10 +438,12 @@ export class AccountDirectory {
       }
       if (nextName !== undefined) account.name = nextName;
       if (nextDisabled !== undefined) account.disabled = nextDisabled;
+      if (nextLimit !== undefined) account.quotaLimit = nextLimit;
       this.#logger?.info(
-        'updated account %s (disabled=%s)',
+        'updated account %s (disabled=%s limit=%s)',
         account.id,
         account.disabled === true ? 'yes' : 'no',
+        account.quotaLimit ?? 'none',
       );
       return publicAccount(account);
     });
@@ -546,9 +584,21 @@ export function rankForNewSession(accounts, headroomOf) {
   for (const account of Array.isArray(accounts) ? accounts : []) {
     if (account.signedIn !== true || account.disabled === true) continue;
     const headroom = headroomOf(account.id);
+    // A local ceiling converts "percent used" into "percent of the ceiling
+    // used": an account limited to 60% with 40% spent has 20 points of *usable*
+    // room left, not 60. Without this, a deliberately throttled account would
+    // still look like the roomiest one and take the next conversation.
+    const limit = typeof account.quotaLimit === 'number' ? account.quotaLimit : undefined;
+    let remaining = headroom === undefined ? undefined : headroom.remaining;
+    if (remaining !== undefined && limit !== undefined) {
+      // Headroom is "percent still unused"; the ceiling shrinks the usable pool,
+      // so compare against the ceiling instead of 100.
+      const used = 100 - remaining;
+      remaining = Math.max(0, limit - used);
+    }
     rows.push({
       id: account.id,
-      remaining: headroom === undefined ? undefined : headroom.remaining,
+      remaining,
       resetsAt: headroom === undefined ? undefined : headroom.resetsAt,
     });
   }

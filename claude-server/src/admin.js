@@ -663,9 +663,11 @@ function accountsBody(options) {
       // cannot happen, and removing it would strand the deployment's own grant.
       // So its cell holds the one action it has and a caption, not a pair of
       // buttons that would be refused.
+      const setLimit = `<button class="small" type="button" data-action="limit" data-id="${esc(account.id)}" data-name="${esc(account.name)}" data-limit="${account.quotaLimit ?? ''}" aria-label="Set the local limit for account ${esc(account.name)}">Limit</button>`;
       const actions = isDefault
         ? `<div class="action-stack">${signIn}<span class="action-note">Identity fixed by GRANT_PATH</span></div>`
-        : `<button class="small" type="button" data-action="rename" data-id="${esc(
+        : setLimit +
+          `<button class="small" type="button" data-action="rename" data-id="${esc(
             account.id,
           )}" data-name="${esc(account.name)}" aria-label="Rename account ${esc(account.name)}">Rename</button>` +
           signIn +
@@ -677,6 +679,7 @@ function accountsBody(options) {
           <td>${name}</td>
           <td><div class="state-cell">${state}<span class="state-note">${esc(stateNote)}</span></div></td>
           <td>${tokens}</td>
+          <td>${limitCell(account)}</td>
           <td class="when">${expires}</td>
           <td class="actions">${actions}</td>
         </tr>`;
@@ -712,7 +715,7 @@ function accountsBody(options) {
               ? `<p class="empty" style="padding:var(--s-4)">No accounts yet. The default account appears once <code>GRANT_PATH</code> holds a grant.</p>`
               : `<div class="table-wrap"><table class="data" id="accounts-table">
             <thead><tr>
-              <th>Name</th><th>State</th><th>Tokens</th><th>Token expires</th>
+              <th>Name</th><th>State</th><th>Tokens</th><th>Local limit</th><th>Token expires</th>
               <th class="num">Actions</th>
             </tr></thead>
             <tbody>
@@ -730,6 +733,22 @@ function accountsBody(options) {
       <p class="note">A token is bound to one account and only ever spends that subscription.
         A signed-in account answers relayed requests; a signed-out or disabled one refuses them rather than
         borrowing another account's grant.</p>`;
+}
+
+/**
+ * The cell describing an account's local ceiling.
+ *
+ * A limit is the share of the five-hour window this deployment is willing to
+ * spend: `60` means "stop starting new conversations here once it is 60% used",
+ * which is how an account is held back as a reserve instead of being drained in
+ * parallel with the others.
+ * @param account - the account row.
+ * @returns escaped markup.
+ */
+function limitCell(account) {
+  const limit = account.quotaLimit;
+  if (typeof limit !== 'number') return '<span class="dash">no limit</span>';
+  return `<code>${limit}%</code>`;
 }
 
 function accountOptions(accounts) {
@@ -1784,6 +1803,35 @@ const CONSOLE_SCRIPT = `
           return response.json().catch(function () { return null; }).then(function (body) {
             if (!response.ok) {
               showAccountsError((body && body.error) || ('HTTP ' + response.status));
+              return;
+            }
+            reloadAccounts();
+          });
+        });
+        return;
+      }
+      if (action === 'limit') {
+        var current = button.dataset.limit || '';
+        var next = window.prompt(
+          'Local limit for "' + (button.dataset.name || '') + '" as a percent of the 5-hour window (1-100), or leave empty for no limit',
+          current,
+        );
+        if (next === null) return;
+        var trimmed = next.trim();
+        var body = trimmed === '' ? { quotaLimit: null } : { quotaLimit: Number(trimmed) };
+        if (trimmed !== '' && !(body.quotaLimit >= 1 && body.quotaLimit <= 100)) {
+          showAccountsError('A limit must be a percentage between 1 and 100.');
+          return;
+        }
+        fetch('/admin/api/accounts/' + encodeURIComponent(id), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(body)
+        }).then(function (response) {
+          return response.json().catch(function () { return null; }).then(function (payload) {
+            if (!response.ok) {
+              showAccountsError((payload && payload.error) || ('HTTP ' + response.status));
               return;
             }
             reloadAccounts();
