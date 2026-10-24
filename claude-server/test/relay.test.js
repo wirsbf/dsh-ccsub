@@ -412,3 +412,178 @@ test('a relayed non-streaming call is recorded in the ledger', async () => {
     await upstream.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Multi-account isolation over the real HTTP surface.
+//
+// The unit tests pin the directory's behaviour; this pins the wiring: a token
+// bound to account A must reach upstream with A's access token and never B's.
+// ---------------------------------------------------------------------------
+
+/** Boot a server with two accounts, each holding a different grant. */
+async function startMultiAccountServer(upstreamOrigin) {
+  const { mkdir } = await import('node:fs/promises');
+  const { AccountDirectory } = await import('../src/accounts.js');
+  const { UserDirectory } = await import('../src/users.js');
+
+  const dir = await mkdtemp(join(tmpdir(), 'claude-server-multi-'));
+  const grantPath = join(dir, 'grant.json');
+  const accounts = new AccountDirectory({
+    path: join(dir, 'accounts.json'),
+    grantsDir: join(dir, 'accounts'),
+    legacyGrantPath: grantPath,
+    refreshSkewMs: 1000,
+    logger: quietLogger,
+  });
+  await mkdir(join(dir, 'accounts'), { recursive: true });
+
+  // Default account, then two extra accounts with distinct tokens.
+  await accounts.store(null).write({
+    type: 'oauth',
+    access: 'token-default',
+    refresh: 'r-default',
+    expires: Date.now() + 3_600_000,
+  });
+  const work = await accounts.create({ name: 'Work' });
+  await accounts.store(work.id).write({
+    type: 'oauth',
+    access: 'token-work',
+    refresh: 'r-work',
+    expires: Date.now() + 3_600_000,
+  });
+  const personal = await accounts.create({ name: 'Personal' });
+  await accounts.store(personal.id).write({
+    type: 'oauth',
+    access: 'token-personal',
+    refresh: 'r-personal',
+    expires: Date.now() + 3_600_000,
+  });
+
+  // One token per account, plus one pre-accounts token with no accountId.
+  const users = new UserDirectory({ path: join(dir, 'users.json'), logger: quietLogger });
+  const legacyUser = await users.create({ name: 'old-token' });
+  const workUser = await users.create({ name: 'work-token', accountId: work.id });
+  const personalUser = await users.create({ name: 'personal-token', accountId: personal.id });
+
+  const config = {
+    listenHost: '127.0.0.1',
+    listenPort: 0,
+    mode: 'direct',
+    grantPath,
+    accountsPath: join(dir, 'accounts.json'),
+    grantsDir: join(dir, 'accounts'),
+    clientBearer: CLIENT_BEARER,
+    claudeCliVersion: '2.1.303',
+    stainlessRuntimeVersion: 'v22.19.0',
+    refreshSkewMs: 1000,
+    loginTtlMs: 60_000,
+    sanitizeBody: false,
+    logLevel: 'error',
+    maxBodyBytes: 1024 * 1024,
+  };
+  const transport = new Transport({ mode: 'direct' });
+  const built = createServer({
+    config,
+    transport,
+    accounts,
+    users,
+    logger: quietLogger,
+    hosts: { apiHost: upstreamOrigin, platformHost: upstreamOrigin },
+  });
+  await new Promise((resolve) => built.server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${built.server.address().port}`;
+  return {
+    origin,
+    directory: accounts,
+    tokens: {
+      legacy: legacyUser.token,
+      work: workUser.token,
+      personal: personalUser.token,
+    },
+    accounts: { work: work.id, personal: personal.id },
+    paths: {
+      grantPath,
+      accountsPath: join(dir, 'accounts.json'),
+      grantsDir: join(dir, 'accounts'),
+    },
+    async close() {
+      await built.dispose();
+      await transport.dispose();
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('each account token reaches upstream with its own subscription token', async () => {
+  const upstream = await startUpstream();
+  const server = await startMultiAccountServer(upstream.origin);
+  try {
+    const cases = [
+      { label: 'pre-accounts token', token: server.tokens.legacy, access: 'token-default' },
+      { label: 'work', token: server.tokens.work, access: 'token-work' },
+      { label: 'personal', token: server.tokens.personal, access: 'token-personal' },
+    ];
+    for (const item of cases) {
+      upstream.seen.length = 0;
+      const response = await post(server.origin, '/v1/messages', { model: 'claude-sonnet-5-5' }, item.token);
+      assert.equal(response.status, 200, `${item.label} should relay`);
+      assert.equal(upstream.seen.length, 1, `${item.label} should make one upstream call`);
+      assert.equal(
+        upstream.seen[0].headers.authorization,
+        `Bearer ${item.access}`,
+        `${item.label} must spend its own account's subscription`,
+      );
+      // The client's own token must never reach upstream.
+      assert.notEqual(upstream.seen[0].headers.authorization, `Bearer ${item.token}`);
+    }
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});
+
+test('a token on an account with no grant is refused, not redirected to another', async () => {
+  // The failure this guards: a signed-out account must never silently spend the
+  // default account's subscription. The operator would see the wrong quota
+  // drain and have no reason to suspect it.
+  const upstream = await startUpstream();
+  const server = await startMultiAccountServer(upstream.origin);
+  try {
+    await server.directory.remove(server.accounts.personal);
+
+    upstream.seen.length = 0;
+    const response = await post(server.origin, '/v1/messages', { model: 'x' }, server.tokens.personal);
+    assert.equal(response.status, 403, 'a token whose account is gone is refused');
+    assert.equal(upstream.seen.length, 0, 'and never reaches upstream');
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});
+
+test('disabling an account refuses its token while the others keep working', async () => {
+  const upstream = await startUpstream();
+  const server = await startMultiAccountServer(upstream.origin);
+  try {
+    await server.directory.update(server.accounts.work, { disabled: true });
+
+    upstream.seen.length = 0;
+    const refused = await post(server.origin, '/v1/messages', { model: 'x' }, server.tokens.work);
+    assert.equal(refused.status, 403, 'a disabled account is refused');
+    assert.equal(upstream.seen.length, 0, 'and never reaches upstream');
+
+    // The default account is unaffected.
+    const ok = await post(server.origin, '/v1/messages', { model: 'x' }, server.tokens.legacy);
+    assert.equal(ok.status, 200);
+    assert.equal(upstream.seen[0].headers.authorization, 'Bearer token-default');
+
+    // An unknown bearer is refused before any account is considered.
+    upstream.seen.length = 0;
+    const bogus = await post(server.origin, '/v1/messages', { model: 'x' }, 'ccs_does_not_exist');
+    assert.equal(bogus.status, 401);
+    assert.equal(upstream.seen.length, 0);
+  } finally {
+    await server.close();
+    await upstream.close();
+  }
+});

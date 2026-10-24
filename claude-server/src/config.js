@@ -38,6 +38,24 @@ function defaultUsersPath(grantPath) {
 }
 
 /**
+ * The account directory's default location: beside the grant.
+ * @param grantPath - the resolved grant path.
+ * @returns the default accounts file path.
+ */
+function defaultAccountsPath(grantPath) {
+  return join(dirname(grantPath), 'accounts.json');
+}
+
+/**
+ * Where accounts other than the default keep their grants.
+ * @param grantPath - the resolved grant path.
+ * @returns the default grants directory.
+ */
+function defaultGrantsDir(grantPath) {
+  return join(dirname(grantPath), 'accounts');
+}
+
+/**
  * Build the configuration from the environment.
  * @param env - the process environment.
  * @returns the configuration.
@@ -54,6 +72,14 @@ export function loadConfig(env = process.env) {
   if (grantPath.length === 0) throw new Error('GRANT_PATH must not be empty');
   const usersPath = String(env.USERS_PATH ?? defaultUsersPath(grantPath)).trim();
   if (usersPath.length === 0) throw new Error('USERS_PATH must not be empty');
+  // The account directory and the extra accounts' grants both default to
+  // siblings of the legacy grant, so an upgraded deployment keeps its existing
+  // volume layout and needs no new paths in its environment file. The default
+  // account *is* GRANT_PATH, so nothing is moved during the upgrade.
+  const accountsPath = String(env.ACCOUNTS_PATH ?? defaultAccountsPath(grantPath)).trim();
+  if (accountsPath.length === 0) throw new Error('ACCOUNTS_PATH must not be empty');
+  const grantsDir = String(env.GRANTS_DIR ?? defaultGrantsDir(grantPath)).trim();
+  if (grantsDir.length === 0) throw new Error('GRANTS_DIR must not be empty');
   return {
     listenHost,
     listenPort,
@@ -61,6 +87,8 @@ export function loadConfig(env = process.env) {
     proxyUrl: env.PROXY_URL,
     grantPath,
     usersPath,
+    accountsPath,
+    grantsDir,
     clientBearer: env.CLIENT_BEARER,
     claudeCliVersion: String(env.CLAUDE_CLI_VERSION ?? '2.1.303').trim() || '2.1.303',
     // Pinned rather than read from this process: the claimed runtime must not

@@ -39,6 +39,7 @@ import {
   renderConsolePage,
   renderLockPage,
 } from './admin.js';
+import { AccountDirectory, AccountsError, DEFAULT_ACCOUNT_ID } from './accounts.js';
 import { ClientAuth } from './auth.js';
 import { THINKING_BETAS, ensureBaseBetas, wantsThinkingBetas, withClaudeIdentity } from './identity.js';
 import { LoginSessions } from './login.js';
@@ -124,6 +125,29 @@ export function createServer(options) {
       ? new UserDirectory({ path: config.usersPath, logger })
       : undefined);
   const auth = new ClientAuth(config.clientBearer, { users });
+  /**
+   * The account directory.
+   *
+   * `options.accounts` is injected by the entry point. A caller that provides
+   * none still gets a working single-account server: the directory is built over
+   * the legacy grant path, so `GRANT_PATH` keeps working exactly as before and
+   * only the multi-account routes have anything to list.
+   */
+  const accounts =
+    options.accounts ??
+    // Without a `grantPath` there is nothing to key a directory on. That is the
+    // shape a caller uses when it injects its own single `grants` store (tests,
+    // and any embedder that owns one grant); such a server keeps the
+    // single-account behaviour and simply has no account list to serve.
+    (typeof config?.grantPath === 'string' && config.grantPath.length > 0
+      ? new AccountDirectory({
+          path: config.accountsPath ?? `${config.grantPath}.accounts.json`,
+          grantsDir: config.grantsDir ?? `${config.grantPath}.grants`,
+          legacyGrantPath: config.grantPath,
+          refreshSkewMs: config.refreshSkewMs,
+          logger,
+        })
+      : undefined);
   const sessions = new LoginSessions({ ttlMs: config.loginTtlMs });
   const adminSessions = new AdminSessions();
   // Console reads of the usage endpoint share this cache. Anthropic rate-limits
@@ -136,9 +160,30 @@ export function createServer(options) {
   const QUOTA_CACHE_MS = 5 * 60_000;
   const maxBodyBytes = config.maxBodyBytes ?? 32 * 1024 * 1024;
 
-  /** Resolve the access token through the grant store. */
-  const accessToken = async () =>
-    await grants.accessToken(async (refreshToken) => await refreshGrant(refreshToken, transport.fetch));
+  /**
+   * Resolve the access token for one account.
+   *
+   * The account is chosen by the caller's identity, not by configuration: a
+   * token issued on account A must spend account A's subscription. `null` or
+   * absent means the default account, which is what every pre-accounts token
+   * and the bootstrap bearer resolve to.
+   * @param accountId - the account the caller is bound to.
+   * @returns the bearer token to send upstream.
+   */
+  const refreshFn = async (refreshToken) => await refreshGrant(refreshToken, transport.fetch);
+  const accessToken = async (accountId) => {
+    if (accounts !== undefined) return await accounts.accessToken(accountId, refreshFn);
+    // Single-account embedder: one injected store serves every caller, which is
+    // exactly what this server did before accounts existed.
+    if (grants === undefined) {
+      const error = new Error('no grant store is mounted on this server');
+      error.code = 'NOT_SIGNED_IN';
+      throw error;
+    }
+    return await grants.accessToken(refreshFn);
+  };
+  /** The grant store for one account, or the injected single store. */
+  const storeFor = (accountId) => (accounts !== undefined ? accounts.store(accountId) : grants);
 
   /** Send an HTML reply. Always uncacheable: it reflects live credential state. */
   const sendHtml = (res, status, html) => {
@@ -161,10 +206,15 @@ export function createServer(options) {
     res.end();
   };
 
-  /** Read the current grant state without letting a corrupt file throw. */
-  const grantState = async () => {
+  /**
+   * Read one account's grant state without letting a corrupt file throw.
+   * @param accountId - the account to inspect (null = default).
+   * @returns whether it is signed in and when its token expires.
+   */
+  const grantState = async (accountId) => {
     try {
-      const grant = await grants.read();
+      const store = storeFor(accountId);
+      const grant = store === undefined ? undefined : await store.read();
       return {
         signedIn: grant !== undefined,
         expiresAt: typeof grant?.expires === 'number' ? grant.expires : null,
@@ -221,7 +271,7 @@ export function createServer(options) {
     // --- pages ------------------------------------------------------------
     if (req.method === 'GET' && (pathname === ADMIN_PREFIX || pathname === `${ADMIN_PREFIX}/`)) {
       if (!signedIn) {
-        const state = await grantState();
+        const state = await grantState(null);
         sendHtml(res, 200, renderLockPage({ ...state, mode: transport.mode }));
         return;
       }
@@ -235,7 +285,7 @@ export function createServer(options) {
         sendRedirect(res, ADMIN_PREFIX);
         return;
       }
-      const state = await grantState();
+      const state = await grantState(null);
       sendHtml(
         res,
         200,
@@ -247,6 +297,12 @@ export function createServer(options) {
           identity,
           // Only the pages that show a user count pay for the read.
           users: page === 'users' || page === 'overview' ? await userList() : [],
+          // The Accounts page renders the list; the Users page needs it to
+          // resolve each token's account name. Other pages pay nothing.
+          accounts:
+            (page === 'accounts' || page === 'users') && accounts !== undefined
+              ? await accounts.list().catch(() => [])
+              : [],
         }),
       );
       return;
@@ -341,7 +397,7 @@ export function createServer(options) {
 
     // --- status -----------------------------------------------------------
     if (pathname === `${ADMIN_PREFIX}/api/status` && req.method === 'GET') {
-      const state = await grantState();
+      const state = await grantState(null);
       sendJson(res, 200, {
         ok: true,
         signedIn: state.signedIn,
@@ -455,7 +511,21 @@ export function createServer(options) {
         const payload = await readJson(req, res, 8 * 1024);
         if (payload === undefined) return;
         try {
-          const { user, token } = await users.create({ name: payload?.name, role: payload?.role });
+          // A named account must exist before a token can be bound to it: a
+          // token pointing at a removed account would be refused at relay time
+          // with no clue why, so the mistake is caught at creation instead.
+          const requestedAccount =
+            payload?.accountId === undefined || payload?.accountId === null || payload?.accountId === ''
+              ? null
+              : String(payload.accountId).trim();
+          if (requestedAccount !== null && accounts !== undefined) {
+            await accounts.require(requestedAccount);
+          }
+          const { user, token } = await users.create({
+            name: payload?.name,
+            role: payload?.role,
+            accountId: requestedAccount,
+          });
           // The one and only reveal. Nothing is logged with the token in it.
           sendJson(res, 200, { ok: true, user, token });
         } catch (error) {
@@ -508,14 +578,93 @@ export function createServer(options) {
       return;
     }
 
+    // --- Accounts ----------------------------------------------------------
+    // The accounts this server serves. Reading the list is what the console's
+    // Accounts page needs; mutating one is admin work like user management, and
+    // sits under the same session gate above.
+    if (pathname === `${ADMIN_PREFIX}/api/accounts` && req.method === 'GET') {
+      await api(async () => {
+        try {
+          sendJson(res, 200, { ok: true, accounts: await accounts.list() });
+        } catch (error) {
+          sendJson(res, 500, { error: error.message, code: error.code ?? 'ACCOUNTS_FAILED' });
+        }
+      })();
+      return;
+    }
+
+    if (pathname === `${ADMIN_PREFIX}/api/accounts` && req.method === 'POST') {
+      await api(async () => {
+        const payload = await readJson(req, res, 16 * 1024);
+        if (payload === undefined) return;
+        try {
+          const account = await accounts.create({ name: payload?.name });
+          sendJson(res, 201, { ok: true, account });
+        } catch (error) {
+          sendJson(res, 400, { error: error.message, code: error.code });
+        }
+      })();
+      return;
+    }
+
+    if (pathname.startsWith(`${ADMIN_PREFIX}/api/accounts/`)) {
+      const rest = pathname.slice(`${ADMIN_PREFIX}/api/accounts/`.length);
+      const id = decodeURIComponent(rest);
+      await api(async () => {
+        if (req.method === 'PATCH') {
+          const payload = await readJson(req, res, 16 * 1024);
+          if (payload === undefined) return;
+          try {
+            const account = await accounts.update(id, payload ?? {});
+            sendJson(res, 200, { ok: true, account });
+          } catch (error) {
+            const status = error?.code === 'UNKNOWN_ACCOUNT' ? 404 : 400;
+            sendJson(res, status, { error: error.message, code: error.code });
+          }
+          return;
+        }
+        if (req.method === 'DELETE') {
+          try {
+            const removed = await accounts.remove(id);
+            if (!removed) {
+              sendJson(res, 404, { error: 'that account does not exist', code: 'UNKNOWN_ACCOUNT' });
+              return;
+            }
+            sendJson(res, 200, { ok: true });
+          } catch (error) {
+            const status = error?.code === 'UNKNOWN_ACCOUNT' ? 404 : 400;
+            sendJson(res, status, { error: error.message, code: error.code });
+          }
+          return;
+        }
+        sendJson(res, 405, { error: 'method not allowed' });
+      })();
+      return;
+    }
+
     // --- Claude sign-in ----------------------------------------------------
     if (pathname === `${ADMIN_PREFIX}/api/login/start` && req.method === 'POST') {
-      try {
-        const attempt = sessions.create();
-        sendJson(res, 200, { id: attempt.id, url: attempt.url, expiresAt: attempt.expiresAt });
-      } catch (error) {
-        sendJson(res, 429, { error: error.message, code: error.code });
-      }
+      await api(async () => {
+        const payload = await readJson(req, res, 8 * 1024);
+        if (payload === undefined) return;
+        // `accountId` picks which subscription this grant belongs to. Absent or
+        // null is the default account, which is what the single-account shape
+        // has always meant.
+        const requested = payload?.accountId === undefined || payload.accountId === null ? null : String(payload.accountId).trim();
+        try {
+          if (requested !== null && requested !== '') await accounts.require(requested);
+          const attempt = sessions.create({ accountId: requested === '' ? null : requested });
+          sendJson(res, 200, {
+            id: attempt.id,
+            url: attempt.url,
+            accountId: attempt.accountId,
+            expiresAt: attempt.expiresAt,
+          });
+        } catch (error) {
+          const status = error?.code === 'UNKNOWN_ACCOUNT' || error?.code === 'ACCOUNT_DISABLED' ? 404 : 429;
+          sendJson(res, status, { error: error.message, code: error.code });
+        }
+      })();
       return;
     }
 
@@ -546,10 +695,15 @@ export function createServer(options) {
         }
         try {
           const grant = await exchangeCode(parsed.code, attempt.verifier, transport.fetch);
-          await grants.write(grant);
+          // Write to the account the attempt was opened for, so a grant cannot
+          // land on a different subscription than the URL the operator used.
+          await storeFor(attempt.accountId).write(grant);
           sessions.consume(payload.id);
-          logger.info('stored a new Claude subscription grant (console)');
-          sendJson(res, 200, { ok: true, expiresAt: grant.expires });
+          logger.info(
+            'stored a new Claude subscription grant (console, account %s)',
+            attempt.accountId ?? 'default',
+          );
+          sendJson(res, 200, { ok: true, accountId: attempt.accountId, expiresAt: grant.expires });
         } catch (error) {
           logger.warn('the console authorization-code exchange failed: %s', String(error));
           sendJson(res, 502, { error: String(error?.message ?? error), code: 'EXCHANGE_FAILED' });
@@ -585,9 +739,13 @@ export function createServer(options) {
 
       // Liveness is the only unauthenticated route.
       if (pathname === '/healthz') {
+        // The deployment's own liveness is defined by its default account: a
+        // caller cannot name an account here, and reporting every account's
+        // state would leak the account list to an unauthenticated probe.
         let signedIn = false;
         try {
-          signedIn = (await grants.read()) !== undefined;
+          const store = storeFor(null);
+          signedIn = store !== undefined && (await store.read()) !== undefined;
         } catch {
           signedIn = false;
         }
@@ -656,10 +814,13 @@ export function createServer(options) {
         }
         try {
           const grant = await exchangeCode(parsed.code, attempt.verifier, transport.fetch);
-          await grants.write(grant);
+          await storeFor(attempt.accountId).write(grant);
           sessions.consume(payload.id);
-          logger.info('stored a new Claude subscription grant');
-          sendJson(res, 200, { ok: true, expiresAt: grant.expires });
+          logger.info(
+            'stored a new Claude subscription grant (account %s)',
+            attempt.accountId ?? 'default',
+          );
+          sendJson(res, 200, { ok: true, accountId: attempt.accountId, expiresAt: grant.expires });
         } catch (error) {
           logger.warn('the authorization-code exchange failed: %s', String(error));
           sendJson(res, 502, { error: String(error?.message ?? error), code: 'EXCHANGE_FAILED' });
@@ -680,10 +841,14 @@ export function createServer(options) {
       }
 
       if (pathname === '/status' && req.method === 'GET') {
+        // The relay's own status is the default account's: the caller here
+        // holds a bearer whose account is not part of this contract, and
+        // changing what `/status` means would break existing clients.
         let grant;
         let error;
         try {
-          grant = await grants.read();
+          const store = storeFor(null);
+          grant = store === undefined ? undefined : await store.read();
         } catch (caught) {
           error = String(caught?.message ?? caught);
         }
@@ -697,7 +862,17 @@ export function createServer(options) {
       }
 
       // Everything else is a relay.
-      await relay(req, res, { config, transport, logger, accessToken, hosts, usageLedger });
+      await relay(req, res, {
+        config,
+        transport,
+        logger,
+        accessToken,
+        hosts,
+        usageLedger,
+        // The account the caller's token is bound to. This is what makes two
+        // tokens on two accounts spend two different subscriptions.
+        accountId: identity?.accountId ?? null,
+      });
     })().catch((error) => {
       logger.error('unhandled request failure: %s', String(error));
       if (!res.headersSent) sendJson(res, 500, { error: 'internal error' });
@@ -712,6 +887,11 @@ export function createServer(options) {
     usage: usageLedger,
     // Exposed for the same reason: tests drive the directory through the server.
     users,
+    // The account directory this server actually holds. A caller must mutate
+    // *this* instance, not a second one over the same files: the directory
+    // memoizes its file, so a separate instance would write a change the
+    // running server never sees.
+    accounts,
     async dispose() {
       await new Promise((resolve) => server.close(() => resolve()));
     },
@@ -726,7 +906,7 @@ export function createServer(options) {
  * back byte for byte with its framing headers intact.
  */
 async function relay(req, res, ctx) {
-  const { config, transport, logger, accessToken, usageLedger } = ctx;
+  const { config, transport, logger, accessToken, usageLedger, accountId } = ctx;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const target = upstreamFor(url.pathname, url.search, ctx.hosts ?? {});
 
@@ -761,10 +941,18 @@ async function relay(req, res, ctx) {
 
   let token;
   try {
-    token = await accessToken();
+    token = await accessToken(accountId);
   } catch (error) {
     const code = error?.code ?? 'TOKEN_UNAVAILABLE';
-    const status = code === 'NOT_SIGNED_IN' ? 401 : 502;
+    // Three distinct refusals, three distinct statuses: the account itself is
+    // unusable (403, retrying will not help), that account is signed out (401,
+    // an operator has to sign it in), or the refresh failed (502, upstream).
+    const status =
+      code === 'ACCOUNT_DISABLED' || code === 'UNKNOWN_ACCOUNT'
+        ? 403
+        : code === 'NOT_SIGNED_IN'
+          ? 401
+          : 502;
     sendJson(res, status, { error: String(error?.message ?? error), code });
     return;
   }

@@ -57,6 +57,7 @@ export const ADMIN_HOME = `${ADMIN_PREFIX}/overview`;
  */
 export const CONSOLE_PAGES = [
   { id: 'overview', path: `${ADMIN_PREFIX}/overview`, label: 'Overview' },
+  { id: 'accounts', path: `${ADMIN_PREFIX}/accounts`, label: 'Accounts' },
   { id: 'account', path: `${ADMIN_PREFIX}/account`, label: 'Account' },
   { id: 'users', path: `${ADMIN_PREFIX}/users`, label: 'Users' },
   { id: 'usage', path: `${ADMIN_PREFIX}/usage`, label: 'Usage' },
@@ -193,6 +194,8 @@ function brandMarkup(home) {
 const ICONS = {
   overview:
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>',
+  accounts:
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5h18"/><path d="M3 12h18"/><path d="M3 16.5h18"/><circle cx="6.5" cy="7.5" r="1"/><circle cx="6.5" cy="12" r="1"/><circle cx="6.5" cy="16.5" r="1"/></svg>',
   account:
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/></svg>',
   users:
@@ -210,6 +213,10 @@ const PAGE_META = {
   overview: {
     title: 'Overview',
     subtitle: 'The state of the subscription this server holds, at a glance.',
+  },
+  accounts: {
+    title: 'Accounts',
+    subtitle: 'The Claude subscriptions this server serves. Each has its own sign-in and quota.',
   },
   account: {
     title: 'Account',
@@ -528,6 +535,7 @@ function usersBody(options) {
       return `<tr data-user-row="${esc(user.id)}">
           <td class="strong">${name}</td>
           <td>${role}</td>
+          <td>${accountCell(user, options.accounts)}</td>
           <td>${status}</td>
           <td class="when">${esc(stamp(user.createdAt))}</td>
           <td class="when">${esc(stamp(user.lastUsedAt))}</td>
@@ -553,11 +561,18 @@ function usersBody(options) {
               <option value="admin">admin</option>
             </select>
           </div>
+          <div class="field compact">
+            <label for="user-account">Account</label>
+            <select id="user-account" name="accountId" aria-describedby="account-hint">
+              ${accountOptions(options.accounts)}
+            </select>
+          </div>
           <div class="form-submit">
             <button class="primary" id="add-user" type="submit">Create token</button>
           </div>
         </form>
         <p class="field-hint" id="role-hint"><code>client</code> may call the relay. <code>admin</code> may also unlock this console and manage users.</p>
+        <p class="field-hint" id="account-hint">The subscription this token spends. A token only ever uses the account it is bound to.</p>
         <p class="msg err" id="users-error" hidden></p>`,
       )}
       <section class="card">
@@ -568,7 +583,7 @@ function usersBody(options) {
               ? '<p class="empty" style="padding:1rem">No users yet.</p>'
               : `<div class="table-wrap"><table class="data" id="users-table">
             <thead><tr>
-              <th>Name</th><th>Role</th><th>Status</th><th>Created</th><th>Last used</th>
+              <th>Name</th><th>Role</th><th>Account</th><th>Status</th><th>Created</th><th>Last used</th>
               <th class="num">Actions</th>
             </tr></thead>
             <tbody>
@@ -578,6 +593,133 @@ function usersBody(options) {
           }
         </div>
       </section>`;
+}
+
+/**
+ * The Accounts page: one row per Claude subscription this server serves.
+ *
+ * Sign-in is per account, so this page owns the "Sign in" button and renders the
+ * authorize URL inline. The default account is the one at `GRANT_PATH`; it
+ * cannot be renamed or removed because it is configuration, and the page says
+ * so rather than offering controls that would be refused.
+ */
+function accountsBody(options) {
+  const accounts = Array.isArray(options.accounts) ? options.accounts : [];
+  const rows = accounts
+    .map((account) => {
+      const isDefault = account.default === true;
+      const name = `${esc(account.name)}${isDefault ? ` ${pill('default', 'accent')}` : ''}`;
+      const status =
+        account.signedIn === true
+          ? pill('signed in', 'on')
+          : account.error === null || account.error === undefined
+            ? pill('signed out', 'off')
+            : pill('unreadable', 'off');
+      const expires =
+        typeof account.expiresAt === 'number' ? esc(stamp(account.expiresAt)) : '<span class="hint">—</span>';
+      const signIn =
+        `<button class="small" type="button" data-action="signin" data-id="${esc(account.id)}" aria-label="Sign in account ${esc(account.name)}">Sign in</button>`;
+      // The default account is GRANT_PATH: renaming it would imply a rename that
+      // cannot happen, and removing it would strand the deployment's own grant.
+      const actions = isDefault
+        ? signIn + '<span class="hint">fixed by GRANT_PATH</span>'
+        : signIn +
+          `<button class="small" type="button" data-action="rename" data-id="${esc(account.id)}" data-name="${esc(
+            account.name,
+          )}" aria-label="Rename account ${esc(account.name)}">Rename</button>` +
+          `<button class="small danger" type="button" data-action="remove" data-id="${esc(
+            account.id,
+          )}" data-name="${esc(account.name)}" aria-label="Remove account ${esc(account.name)}">Remove</button>`;
+      return `<tr data-account-row="${esc(account.id)}">
+          <td class="strong">${name}</td>
+          <td>${status}</td>
+          <td class="when">${expires}</td>
+          <td class="when">${esc(stamp(account.lastUsedAt))}</td>
+          <td class="actions">${actions}</td>
+        </tr>`;
+    })
+    .join('\n        ');
+
+  return `${pageHead('accounts')}
+      <div id="signin-slot"></div>
+      ${card(
+        'Add account',
+        `<p class="hint">A new account starts signed out. Sign it in from its row once it is created;
+          each account refreshes and spends its own subscription independently.</p>
+        <form class="form-inline" id="add-account-form" autocomplete="off" style="margin-top:1rem">
+          <div class="field">
+            <label for="account-name">Name</label>
+            <input id="account-name" name="name" type="text" maxlength="80" placeholder="Work subscription" required>
+          </div>
+          <div class="form-submit">
+            <button class="primary" id="add-account" type="submit">Create account</button>
+          </div>
+        </form>
+        <p class="msg err" id="accounts-error" hidden></p>`,
+      )}
+      <section class="card">
+        <div class="card-head"><h2>Accounts</h2><div class="actions"><span class="hint" id="accounts-count">${accounts.length} total</span></div></div>
+        <div class="card-body flush">
+          ${
+            accounts.length === 0
+              ? '<p class="empty" style="padding:1rem">No accounts yet.</p>'
+              : `<div class="table-wrap"><table class="data" id="accounts-table">
+            <thead><tr>
+              <th>Name</th><th>State</th><th>Token expires</th><th>Last used</th>
+              <th class="num">Actions</th>
+            </tr></thead>
+            <tbody>
+        ${rows}
+            </tbody>
+          </table></div>`
+          }
+        </div>
+      </section>
+      <p class="note">A token issued to a user is bound to one account and only ever spends that subscription.
+        Removing an account deletes its stored grant; the users pointing at it will be refused until they are
+        moved to another account.</p>`;
+}
+
+/**
+ * The account `<option>` list for the Create-token form.
+ *
+ * The default account is the `""` value: the API reads an absent or null
+ * account id as "default", so the first option needs no special casing.
+ * @param accounts - the account list, when the page loaded one.
+ * @returns escaped option markup.
+ */
+function accountOptions(accounts) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  if (list.length === 0) return '<option value="" selected>default</option>';
+  return list
+    .map((account) => {
+      const isDefault = account.default === true;
+      const value = isDefault ? '' : account.id;
+      const label = account.signedIn === true ? account.name : `${account.name} (signed out)`;
+      return `<option value="${esc(value)}"${isDefault ? ' selected' : ''}>${esc(label)}</option>`;
+    })
+    .join('');
+}
+
+/**
+ * The account cell for one user.
+ *
+ * A user whose `accountId` is null spends the default account — that is what
+ * every pre-accounts token does — so the cell names it rather than showing an
+ * empty box the operator would have to interpret.
+ * @param user - the user row.
+ * @param accounts - the account list, when the page loaded one.
+ * @returns escaped markup.
+ */
+function accountCell(user, accounts) {
+  const id = user.accountId ?? null;
+  if (id === null) return `<span class="hint">default</span>`;
+  const list = Array.isArray(accounts) ? accounts : [];
+  const found = list.find((account) => account.id === id);
+  // A user may point at an account that was removed; showing the raw id is how
+  // the operator finds which row to fix.
+  if (found === undefined) return `<code class="bad">${esc(id)}</code>`;
+  return esc(found.name);
 }
 
 function usageBody(options) {
@@ -613,13 +755,15 @@ export function renderConsolePage(options = {}) {
   const body =
     page === 'overview'
       ? overviewBody(options)
-      : page === 'account'
-        ? accountBody(options)
-        : page === 'users'
-          ? usersBody(options)
-          : page === 'usage'
-            ? usageBody(options)
-            : modelsBody(options);
+      : page === 'accounts'
+        ? accountsBody(options)
+        : page === 'account'
+          ? accountBody(options)
+          : page === 'users'
+            ? usersBody(options)
+            : page === 'usage'
+              ? usageBody(options)
+              : modelsBody(options);
   return shell(page, body, options);
 }
 
@@ -1280,7 +1424,12 @@ const CONSOLE_SCRIPT = `
       event.preventDefault();
       addButton.disabled = true;
       usersError.hidden = true;
-      post('/admin/api/users', { name: nameInput.value, role: roleInput.value }).then(function (result) {
+      var accountSelect = document.getElementById('user-account');
+      post('/admin/api/users', {
+        name: nameInput.value,
+        role: roleInput.value,
+        accountId: accountSelect && accountSelect.value ? accountSelect.value : null
+      }).then(function (result) {
         addButton.disabled = false;
         if (!result.ok) {
           showError(usersError, problem(result, 'Create'));
@@ -1389,6 +1538,182 @@ const CONSOLE_SCRIPT = `
     var node = document.getElementById(pair[0]);
     if (node) node.addEventListener('click', pair[1]);
   });
+
+
+  // ---- accounts ----------------------------------------------------------
+  // One row per subscription. Sign-in is per account, so the authorize URL is
+  // rendered inline under the table rather than on the single Account page.
+  var accountsBodyEl = document.getElementById('accounts-table-body');
+  var accountsTable = document.getElementById('accounts-table');
+  var accountsCount = document.getElementById('accounts-count');
+  var accountsError = document.getElementById('accounts-error');
+  var signinSlot = document.getElementById('signin-slot');
+
+  var showAccountsError = function (message) {
+    if (!accountsError) return;
+    accountsError.textContent = message;
+    accountsError.hidden = false;
+  };
+
+  var reloadAccounts = function () { window.location.reload(); };
+
+  var addAccountForm = document.getElementById('add-account-form');
+  if (addAccountForm) {
+    addAccountForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (accountsError) accountsError.hidden = true;
+      var input = document.getElementById('account-name');
+      var name = input ? input.value.trim() : '';
+      if (!name) return;
+      post('/admin/api/accounts', { name: name }).then(function (result) {
+        if (!result.ok) {
+          showAccountsError((result.body && result.body.error) || ('HTTP ' + result.status));
+          return;
+        }
+        reloadAccounts();
+      });
+    });
+  }
+
+  if (accountsTable) {
+    accountsTable.addEventListener('click', function (event) {
+      var button = event.target && event.target.closest ? event.target.closest('button[data-action]') : null;
+      if (button === null) return;
+      var action = button.dataset.action;
+      var id = button.dataset.id;
+      if (action === 'remove') {
+        var label = button.dataset.name || id;
+        if (!window.confirm('Remove the account "' + label + '"? Its stored grant is deleted and its users stop working.')) return;
+        fetch('/admin/api/accounts/' + encodeURIComponent(id), {
+          method: 'DELETE',
+          credentials: 'same-origin'
+        }).then(function (response) {
+          return response.json().catch(function () { return null; }).then(function (body) {
+            if (!response.ok) {
+              showAccountsError((body && body.error) || ('HTTP ' + response.status));
+              return;
+            }
+            reloadAccounts();
+          });
+        });
+        return;
+      }
+      if (action === 'rename') {
+        var current = button.dataset.name || '';
+        var next = window.prompt('Rename account', current);
+        if (next === null) return;
+        if (!next.trim()) return;
+        fetch('/admin/api/accounts/' + encodeURIComponent(id), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ name: next.trim() })
+        }).then(function (response) {
+          return response.json().catch(function () { return null; }).then(function (body) {
+            if (!response.ok) {
+              showAccountsError((body && body.error) || ('HTTP ' + response.status));
+              return;
+            }
+            reloadAccounts();
+          });
+        });
+        return;
+      }
+      if (action === 'signin') {
+        button.disabled = true;
+        post('/admin/api/login/start', { accountId: id }).then(function (result) {
+          if (!result.ok) {
+            button.disabled = false;
+            showAccountsError((result.body && result.body.error) || ('HTTP ' + result.status));
+            return;
+          }
+          renderAccountSignin(id, result.body);
+        });
+      }
+    });
+  }
+
+  /**
+   * Show the authorize URL for one account's sign-in attempt.
+   * The attempt id is held in the closure rather than a hidden field so a
+   * reload cannot submit a stale one.
+   */
+  var renderAccountSignin = function (accountId, started) {
+    if (!signinSlot) return;
+    signinSlot.textContent = '';
+    var card = document.createElement('section');
+    card.className = 'card';
+    var head = document.createElement('div');
+    head.className = 'card-head';
+    var h2 = document.createElement('h2');
+    h2.textContent = 'Sign in account';
+    head.append(h2);
+    var bodyEl = document.createElement('div');
+    bodyEl.className = 'card-body';
+
+    var hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = 'Open this URL, approve the subscription, then paste the callback URL below.';
+    var link = document.createElement('p');
+    var anchor = document.createElement('a');
+    anchor.href = started.url;
+    anchor.target = '_blank';
+    anchor.rel = 'noreferrer';
+    anchor.textContent = started.url;
+    link.append(anchor);
+
+    var field = document.createElement('div');
+    field.className = 'field';
+    var label = document.createElement('label');
+    label.setAttribute('for', 'account-callback');
+    label.textContent = 'Callback URL';
+    var input = document.createElement('input');
+    input.id = 'account-callback';
+    input.type = 'text';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.placeholder = 'http://localhost:53692/callback?code=…&state=…';
+    field.append(label, input);
+
+    var row = document.createElement('div');
+    row.className = 'row';
+    var submit = document.createElement('button');
+    submit.className = 'primary';
+    submit.type = 'button';
+    submit.textContent = 'Finish sign-in';
+    var cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    var err = document.createElement('p');
+    err.className = 'msg err';
+    err.hidden = true;
+    row.append(submit, cancel);
+
+    var startedId = started.id;
+    submit.addEventListener('click', function () {
+      submit.disabled = true;
+      post('/admin/api/login/complete', { id: startedId, code: input.value }).then(function (result) {
+        if (result.ok) {
+          window.location.reload();
+          return;
+        }
+        submit.disabled = false;
+        err.textContent = (result.body && result.body.error) || ('HTTP ' + result.status);
+        err.hidden = false;
+      });
+    });
+    cancel.addEventListener('click', function () {
+      post('/admin/api/login/cancel', { id: startedId }).then(function () { renderAccountSigninClose(); });
+    });
+    bodyEl.append(hint, link, field, row, err);
+    card.append(head, bodyEl);
+    signinSlot.append(card);
+  };
+
+  /** Drop the inline sign-in card without reloading the page. */
+  var renderAccountSigninClose = function () {
+    if (signinSlot) signinSlot.textContent = '';
+  };
 
   if (usageBody) loadUsage();
   if (tokensBody || recentBody || tileCalls) loadTokens(true);

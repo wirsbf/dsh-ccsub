@@ -161,12 +161,32 @@ function normalizeDisabled(raw) {
   return raw;
 }
 
+/**
+ * Validate the account a token spends.
+ *
+ * `undefined` and `null` both mean the default account. The id's *existence* is
+ * checked by the caller that owns the account directory: this module cannot see
+ * that file, and inventing a second source of truth here would let the two
+ * disagree.
+ */
+function normalizeAccountId(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    throw new UsersError('"accountId" must be a non-empty string or null', 'INVALID_ACCOUNT');
+  }
+  const clean = raw.trim();
+  if (!/^[a-z0-9_]{1,40}$/.test(clean)) {
+    throw new UsersError('"accountId" is not a usable account id', 'INVALID_ACCOUNT');
+  }
+  return clean;
+}
+
 /** One stored record, normalized, or a corrupt-file error. */
 function normalizeStoredUser(record, index) {
   if (record === null || typeof record !== 'object') {
     throw new UsersError(`the user file entry ${index} is not an object`, 'USERS_CORRUPT');
   }
-  const { id, name, tokenHash, createdAt, lastUsedAt, disabled, role } = record;
+  const { id, name, tokenHash, createdAt, lastUsedAt, disabled, role, accountId } = record;
   if (typeof id !== 'string' || id.length === 0) {
     throw new UsersError(`the user file entry ${index} has no id`, 'USERS_CORRUPT');
   }
@@ -184,11 +204,20 @@ function normalizeStoredUser(record, index) {
   if (role !== 'admin' && role !== 'client') {
     throw new UsersError(`the user file entry ${index} has an unknown role`, 'USERS_CORRUPT');
   }
+  // Absent or null means the default account: every token issued before
+  // accounts existed resolves to the grant that was the only one at the time,
+  // so an upgrade must not invalidate them. A present value must be a usable id.
+  if (accountId !== undefined && accountId !== null) {
+    if (typeof accountId !== 'string' || !/^[a-z0-9_]{1,40}$/.test(accountId)) {
+      throw new UsersError(`the user file entry ${index} has an unusable account id`, 'USERS_CORRUPT');
+    }
+  }
   return {
     id,
     name,
     role,
     tokenHash,
+    accountId: accountId === undefined ? null : accountId,
     createdAt: typeof createdAt === 'number' ? createdAt : 0,
     lastUsedAt: typeof lastUsedAt === 'number' ? lastUsedAt : null,
     disabled: disabled === true,
@@ -201,6 +230,9 @@ function publicUser(user) {
     id: user.id,
     name: user.name,
     role: user.role,
+    // `null` means the default account. The console renders that as a name
+    // rather than an empty cell, so a pre-accounts token is not a mystery row.
+    accountId: user.accountId ?? null,
     createdAt: user.createdAt,
     lastUsedAt: user.lastUsedAt,
     disabled: user.disabled === true,
@@ -348,15 +380,17 @@ export class UserDirectory {
    * @param options - `name`, and an optional `role` (default `client`).
    * @returns the public user and the plaintext token.
    */
-  async create({ name, role } = {}) {
+  async create({ name, role, accountId } = {}) {
     const cleanName = normalizeName(name);
     const cleanRole = normalizeRole(role === undefined ? 'client' : role);
+    const cleanAccount = normalizeAccountId(accountId);
     const token = `${TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
     const created = {
       id: '',
       name: cleanName,
       role: cleanRole,
       tokenHash: hashToken(token),
+      accountId: cleanAccount,
       createdAt: Date.now(),
       lastUsedAt: null,
       disabled: false,
@@ -370,14 +404,19 @@ export class UserDirectory {
       directory.users.push(created);
       return undefined;
     });
-    this.#logger?.info('added user %s with role %s', created.id, created.role);
+    this.#logger?.info(
+      'added user %s with role %s on account %s',
+      created.id,
+      created.role,
+      created.accountId ?? 'default',
+    );
     return { user: publicUser(created), token };
   }
 
   /**
    * Change one user.
    * @param id - the user id.
-   * @param patch - `name`, `role`, and/or `disabled`.
+   * @param patch - `name`, `role`, `disabled`, and/or `accountId` (null = default).
    * @returns the updated public user.
    * @throws {UsersError} `LEGACY_USER` for the reserved id, `UNKNOWN_USER` when absent.
    */
@@ -388,6 +427,7 @@ export class UserDirectory {
     const nextName = patch.name === undefined ? undefined : normalizeName(patch.name);
     const nextRole = patch.role === undefined ? undefined : normalizeRole(patch.role);
     const nextDisabled = patch.disabled === undefined ? undefined : normalizeDisabled(patch.disabled);
+    const nextAccount = patch.accountId === undefined ? undefined : normalizeAccountId(patch.accountId);
     return await this.#mutate((directory) => {
       const user = directory.users.find((candidate) => candidate.id === id);
       if (user === undefined) {
@@ -396,11 +436,13 @@ export class UserDirectory {
       if (nextName !== undefined) user.name = nextName;
       if (nextRole !== undefined) user.role = nextRole;
       if (nextDisabled !== undefined) user.disabled = nextDisabled;
+      if (nextAccount !== undefined) user.accountId = nextAccount;
       this.#logger?.info(
-        'updated user %s (role=%s disabled=%s)',
+        'updated user %s (role=%s disabled=%s account=%s)',
         user.id,
         user.role,
         user.disabled === true ? 'yes' : 'no',
+        user.accountId ?? 'default',
       );
       return publicUser(user);
     });
@@ -461,7 +503,14 @@ export class UserDirectory {
     }
     if (found === undefined) return undefined;
     await this.#touch(found);
-    return { id: found.id, name: found.name, role: found.role };
+    return {
+      id: found.id,
+      name: found.name,
+      role: found.role,
+      // The account this token spends. `null` is the default account, which is
+      // what every token issued before accounts existed belongs to.
+      accountId: found.accountId ?? null,
+    };
   }
 
   /**

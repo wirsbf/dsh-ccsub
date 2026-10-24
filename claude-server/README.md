@@ -42,6 +42,42 @@ volume as the grant. A missing file means "no users yet"; a corrupt one stops
 stored users from authenticating but leaves the legacy bearer working, so a bad
 user file cannot lock the operator out of the relay.
 
+## Accounts
+
+One process can serve more than one Claude subscription. Each **account** is a
+separate grant with its own sign-in, its own token refresh, and its own quota.
+
+Switch nothing to upgrade: the account that owns `GRANT_PATH` is the **default**
+account, so an existing deployment keeps serving its grant with no data
+movement, and every token issued earlier keeps working — a token with no
+`accountId` is bound to that default account.
+
+Create, sign in, rename, and remove accounts on the **Accounts** page of the
+console (`/admin/accounts`). A new account starts signed out; sign in from its
+row. Each account's grant lives in its own file, and a refresh of one account
+never touches another.
+
+Bind a token to an account when you create it (Users page → **Account**), or
+change it later. A token only ever spends the account it is bound to:
+
+| Situation | Relay result |
+|---|---|
+| token bound to a signed-in account | `200`, upstream sees that account's access token |
+| token bound to a signed-out account | `401 NOT_SIGNED_IN` — it never borrows another account's grant |
+| token bound to a disabled or removed account | `403 ACCOUNT_DISABLED` / `403 UNKNOWN_ACCOUNT` |
+| token whose account was removed | `403`, before anything reaches upstream |
+
+Refusing rather than falling back is deliberate: silently spending a different
+subscription would drain a quota nobody was watching.
+
+The default account cannot be renamed or removed — it *is* `GRANT_PATH` — and
+removing another account deletes its stored grant, so its users stop working
+until they are moved to another account.
+
+Accounts live in `accounts.json`, mode `0600`, beside the grant; extra grants go
+in an `accounts/` directory next to it. Both are only created when you add the
+first account, so an upgraded deployment gains no new files until it needs them.
+
 ## Install and run
 
 ```bash
@@ -109,6 +145,7 @@ Pages (all redirect to unlock without a session):
 |---|---|
 | `/admin` | Unlock form, or a redirect to the overview |
 | `/admin/overview` | Sign-in state, quota windows, user count, relayed calls |
+| `/admin/accounts` | The subscriptions this server serves; per-account sign-in |
 | `/admin/account` | Claude sign-in, grant state, console session |
 | `/admin/users` | Add, disable, and remove users |
 | `/admin/usage` | Token accounting for relayed traffic |
@@ -126,10 +163,14 @@ session is absent):
 | `GET /admin/api/models` | Model catalog |
 | `GET /admin/api/usage` | Token accounting |
 | `GET /admin/api/users` | List users (never includes tokens or hashes) |
-| `POST /admin/api/users` | Create a user; the only place a token is revealed |
+| `POST /admin/api/users` | Create a user (`name`, `role`, optional `accountId`); the only place a token is revealed |
 | `PATCH /admin/api/users/<id>` | Rename, disable, or change the role |
 | `DELETE /admin/api/users/<id>` | Remove a user |
-| `POST /admin/api/login/start` | Begin a Claude sign-in |
+| `GET /admin/api/accounts` | List accounts with their sign-in state |
+| `POST /admin/api/accounts` | Create an account (starts signed out) |
+| `PATCH /admin/api/accounts/<id>` | Rename or disable an account |
+| `DELETE /admin/api/accounts/<id>` | Remove an account and its stored grant |
+| `POST /admin/api/login/start` | Begin a Claude sign-in (optional `accountId`) |
 | `POST /admin/api/login/complete` | Exchange a pasted code |
 | `POST /admin/api/login/cancel` | Discard a pending attempt |
 
@@ -165,6 +206,8 @@ clients a header set a direct connection never produces.
 | `LISTEN_PORT` | `4710` | |
 | `GRANT_PATH` | `/data/grant.json` | Written 0600 via atomic rename |
 | `USERS_PATH` | `users.json` beside `GRANT_PATH` | User directory; 0600, atomic rename. Created on first user, never at boot |
+| `ACCOUNTS_PATH` | `accounts.json` beside `GRANT_PATH` | Account directory; 0600. Created on first extra account, never at boot |
+| `GRANTS_DIR` | `accounts/` beside `GRANT_PATH` | One grant file per non-default account |
 | `CLAUDE_CLI_VERSION` | `2.1.303` | Version claimed on the wire |
 | `STAINLESS_RUNTIME_VERSION` | `v22.19.0` | Pinned, not read from the process |
 | `SANITIZE_BODY` | `true` | Identity-string replacement in `system` |

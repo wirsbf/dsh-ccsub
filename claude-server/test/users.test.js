@@ -47,7 +47,7 @@ test('a created token verifies, and no later read can recover it', async () => {
     assert.equal('tokenHash' in user, false);
 
     const identity = await directory.verify(token);
-    assert.deepEqual(identity, { id: user.id, name: 'alice', role: 'admin' });
+    assert.deepEqual(identity, { id: user.id, name: 'alice', role: 'admin', accountId: null });
 
     // A fresh directory over the same file must not be able to hand the token
     // back, and its list must carry neither the token nor its hash.
@@ -97,7 +97,7 @@ test('verify rejects unknown, disabled, empty, and malformed tokens', async () =
     await directory.update(user.id, { disabled: true });
     assert.equal(await directory.verify(token), undefined);
     await directory.update(user.id, { disabled: false });
-    assert.deepEqual(await directory.verify(token), { id: user.id, name: 'alice', role: 'client' });
+    assert.deepEqual(await directory.verify(token), { id: user.id, name: 'alice', role: 'client', accountId: null });
   } finally {
     await close();
   }
@@ -295,6 +295,7 @@ test('role and name survive a round trip through the file', async () => {
       id: user.id,
       name: 'operations',
       role: 'admin',
+      accountId: null,
     });
   } finally {
     await close();

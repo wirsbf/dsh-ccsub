@@ -9,8 +9,8 @@
  * @module claude-server
  */
 
+import { AccountDirectory } from './accounts.js';
 import { loadConfig } from './config.js';
-import { GrantStore } from './grant.js';
 import { createServer } from './server.js';
 import { Transport } from './transport.js';
 import { UserDirectory } from './users.js';
@@ -38,8 +38,13 @@ async function main() {
   const logger = createLogger(config.logLevel);
 
   const transport = new Transport({ mode: config.mode, proxyUrl: config.proxyUrl });
-  const grants = new GrantStore({
-    path: config.grantPath,
+  // One directory owning every account's grant. The default account resolves to
+  // `GRANT_PATH`, so an upgraded deployment keeps serving its existing grant
+  // without a migration write.
+  const accounts = new AccountDirectory({
+    path: config.accountsPath,
+    grantsDir: config.grantsDir,
+    legacyGrantPath: config.grantPath,
     refreshSkewMs: config.refreshSkewMs,
     logger,
   });
@@ -49,7 +54,7 @@ async function main() {
   // creating a user fails, which is the failure worth having in that situation.
   const users = new UserDirectory({ path: config.usersPath, logger });
 
-  const { server, dispose } = createServer({ config, transport, grants, users, logger });
+  const { server, dispose } = createServer({ config, transport, accounts, users, logger });
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -60,11 +65,12 @@ async function main() {
   });
 
   logger.info(
-    'listening on http://%s:%d (mode=%s, grant=%s)',
+    'listening on http://%s:%d (mode=%s, grant=%s, accounts=%s)',
     config.listenHost,
     config.listenPort,
     config.mode,
     config.grantPath,
+    config.accountsPath,
   );
 
   let closing = false;

@@ -57,10 +57,17 @@ export class LoginSessions {
 
   /**
    * Open one attempt.
+   * Open one attempt.
+   *
+   * `accountId` records which subscription the resulting grant belongs to. It is
+   * carried on the attempt rather than supplied again at `/complete`, so the
+   * exchange cannot be pointed at a different account than the URL that was
+   * shown — the authorize URL the operator actually opened is the binding.
+   * @param options - `accountId` the grant will be stored under (null = default).
    * @returns the attempt id and the authorize URL to show the operator.
    * @throws {LoginError} `TOO_MANY_ATTEMPTS` when the cap is reached.
    */
-  create() {
+  create({ accountId = null } = {}) {
     this.#sweep();
     if (this.#sessions.size >= this.#maxLive) {
       throw new LoginError(
@@ -71,8 +78,14 @@ export class LoginSessions {
     const id = randomBytes(16).toString('hex');
     const { verifier, challenge } = generatePkce();
     const url = authorizeUrl(challenge, verifier);
-    this.#sessions.set(id, { verifier, url, expiresAt: Date.now() + this.#ttlMs });
-    return { id, url, expiresAt: Date.now() + this.#ttlMs };
+    const session = {
+      verifier,
+      url,
+      accountId: accountId === undefined ? null : accountId,
+      expiresAt: Date.now() + this.#ttlMs,
+    };
+    this.#sessions.set(id, session);
+    return { id, url, accountId: session.accountId, expiresAt: session.expiresAt };
   }
 
   /**

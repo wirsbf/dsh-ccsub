@@ -103,7 +103,15 @@ export class ClientAuth {
 
   /** The identity the environment bearer maps to. */
   get legacyIdentity() {
-    return { id: LEGACY_USER_ID, name: LEGACY_USER_NAME, role: 'admin', legacy: true };
+    return {
+      id: LEGACY_USER_ID,
+      name: LEGACY_USER_NAME,
+      role: 'admin',
+      legacy: true,
+      // The bootstrap bearer predates accounts, so it spends the default
+      // account — the same one every pre-accounts token resolves to.
+      accountId: null,
+    };
   }
 
   /**
