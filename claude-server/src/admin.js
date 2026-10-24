@@ -874,6 +874,33 @@ const CONSOLE_SCRIPT = `
     return (result.body && result.body.error) || (what + ': HTTP ' + result.status);
   };
 
+
+  /**
+   * Share of prompt tokens served from cache.
+   *
+   * This is the number that says whether caching is working: a conversation
+   * that stays on one account trends toward 100%, while one that moves between
+   * accounts restarts near zero each turn. Cache-creation counts toward the
+   * denominator because a written token was still a token the prompt paid for.
+   */
+  var hitRate = function (row) {
+    var read = row.cache_read_input_tokens || 0;
+    var write = row.cache_creation_input_tokens || 0;
+    var input = row.input_tokens || 0;
+    var billed = read + write + input;
+    if (billed <= 0) return '—';
+    return Math.round((100 * read) / billed) + '%';
+  };
+
+  /**
+   * A dollar figure. Small values keep four decimals so a cheap model's traffic
+   * does not render as a column of $0.00.
+   */
+  var usd = function (value) {
+    if (typeof value !== 'number' || !isFinite(value)) return '—';
+    return value < 1 ? '$' + value.toFixed(4) : '$' + value.toFixed(2);
+  };
+
   var num = function (n) {
     return typeof n === 'number' ? n.toLocaleString() : '0';
   };
@@ -1058,18 +1085,31 @@ const CONSOLE_SCRIPT = `
       } else {
         var wrap = document.createElement('div');
         wrap.className = 'table-wrap';
+        // Cache read/write belong in this table, not only in the totals: a call
+        // that reads 200k from cache and one that writes 200k cost an order of
+        // magnitude apart, and that distinction is invisible from input/output
+        // alone.
         wrap.append(table(
-          ['Time', 'Model', 'Input', 'Output', 'Duration'],
-          data.recent.slice(0, 6).map(function (call) {
+          ['Time', 'Model', 'Input', 'Output', 'Cache read', 'Cache write', 'Hit', 'Duration'],
+          data.recent.slice(0, 8).map(function (call) {
+            var read = call.cache_read_input_tokens || 0;
+            var write = call.cache_creation_input_tokens || 0;
+            var billed = (call.input_tokens || 0) + read + write;
             return [
               new Date(call.at).toLocaleTimeString(),
               call.model || '(unknown)',
               num(call.input_tokens),
               num(call.output_tokens),
+              num(read),
+              num(write),
+              // Share of the prompt that came from cache. This is the number to
+              // watch: a conversation that stays on one account trends upward,
+              // one that hops accounts restarts near zero every turn.
+              billed > 0 ? Math.round((100 * read) / billed) + '%' : '—',
               call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's'
             ];
           }),
-          2
+          1
         ));
         recentBody.append(wrap);
       }
@@ -1093,14 +1133,16 @@ const CONSOLE_SCRIPT = `
         var section = document.createElement('div');
         section.className = 'table-wrap';
         section.append(table(
-          ['Total', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
+          ['Total', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write', 'Hit rate', 'API value'],
           [[
             'All models',
             num(totals.calls),
             num(totals.input_tokens),
             num(totals.output_tokens),
             num(totals.cache_read_input_tokens),
-            num(totals.cache_creation_input_tokens)
+            num(totals.cache_creation_input_tokens),
+            hitRate(totals),
+            usd(data.costUsd)
           ]],
           1
         ));
@@ -1115,7 +1157,7 @@ const CONSOLE_SCRIPT = `
           var wrap = document.createElement('div');
           wrap.className = 'table-wrap';
           wrap.append(table(
-            ['Model', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write'],
+            ['Model', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write', 'Hit rate', 'API value'],
             models.map(function (row) {
               return [
                 row.model,
@@ -1123,7 +1165,9 @@ const CONSOLE_SCRIPT = `
                 num(row.input_tokens),
                 num(row.output_tokens),
                 num(row.cache_read_input_tokens),
-                num(row.cache_creation_input_tokens)
+                num(row.cache_creation_input_tokens),
+                hitRate(row),
+                usd(row.costUsd)
               ];
             }),
             1
