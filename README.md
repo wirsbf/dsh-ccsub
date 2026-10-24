@@ -262,11 +262,27 @@ supplies an older pi-ai. `dependencyReport()` covers that: it resolves the copy
 actually loaded through the runtime resolver and reports `compatible: false` on
 `/status` when it does not satisfy what `dsh-llm-pi-ai` requires.
 
+Both sides of that comparison must come from the resolver, not from a filesystem
+walk. `dsh-llm-pi-ai` is a peer of this plugin and, on a production install,
+lives inside the harness archive where walking `node_modules` upward cannot
+reach it — the walk finds nothing, the required range is `undefined`, and the
+check reports "unknown" on exactly the installs it exists to guard. The adapter
+manifest is therefore resolved the same way pi-ai's is, with the filesystem walk
+kept only as the linked-install fallback, and the requirement is read from
+`dependencies` first and `peerDependencies` second.
+
+An indeterminate report is logged as indeterminate rather than as success, and
+the card renders drift as an error line and an unknown result as a hint, so a
+mismatch surfaces before the model request it would break.
+
 ## Packaging a release
 
 `npm pack` is the whole release build: it honours `package.json`'s `files` list,
-always adds `README*`, `LICENSE` and `package.json`, and writes the `package/`
-prefix pnpm needs. No build step, no bundler — `lib/` ships as authored.
+always adds `README*` and `package.json`, and writes the `package/` prefix pnpm
+needs. No build step, no bundler — `lib/` ships as authored.
+
+This repository declares no `LICENSE`, so the packed tarball carries none. Add
+one before distributing builds outside your own machine.
 
 ```bash
 npm pack                      # → dsh-ccsub-<version>.tgz

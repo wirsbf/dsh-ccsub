@@ -1,6 +1,6 @@
 {
   "name": "dsh-ccsub",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "Claude Pro/Max subscription route for DSH: browser OAuth (PKCE), quota panel, egress-guarded transport.",
@@ -15,8 +15,12 @@
     "locale",
     "cordis.patch.yml",
     "README.md",
+    "README.zh.md",
     "icon.svg"
   ],
+  "scripts": {
+    "test": "node --test test/"
+  },
   "icon": "./icon.svg",
   "meta": {
     "title": "Claude Subscription",
