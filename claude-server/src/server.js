@@ -1133,6 +1133,9 @@ export function createServer(options) {
         chooseAccount,
         markExhausted,
         exhaustedUntilOf,
+        // Needed to validate a client-named account; undefined on a
+        // single-grant deployment, where the header can only name the default.
+        accounts,
       });
     })().catch((error) => {
       logger.error('unhandled request failure: %s', String(error));
@@ -1165,6 +1168,31 @@ export function createServer(options) {
       await new Promise((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+/**
+ * The request header a client uses to name the account for one request.
+ *
+ * It lets a client pick a subscription explicitly instead of accepting whatever
+ * routing decides. Routing is still the default, because a conversation that
+ * moves accounts loses its prompt cache, so this is for the deliberate case: an
+ * operator draining a specific subscription, or testing one.
+ *
+ * It is a *request* header, not an instruction: the server refuses a name it does
+ * not know, and a token pinned to one account cannot use it to reach another.
+ */
+export const ACCOUNT_HEADER = 'x-ccsub-account';
+
+/**
+ * Read the requested account from a request.
+ * @param headers - the incoming headers.
+ * @returns the trimmed account id, or undefined when the header is absent/blank.
+ */
+export function requestedAccount(headers) {
+  const raw = headers?.[ACCOUNT_HEADER];
+  if (raw === undefined) return undefined;
+  const value = String(Array.isArray(raw) ? raw[0] : raw).trim();
+  return value.length === 0 ? undefined : value;
 }
 
 /**
@@ -1221,6 +1249,7 @@ async function relay(req, res, ctx) {
     chooseAccount,
     markExhausted,
     exhaustedUntilOf,
+    accounts,
   } = ctx;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const target = upstreamFor(url.pathname, url.search, ctx.hosts ?? {});
@@ -1273,9 +1302,43 @@ async function relay(req, res, ctx) {
   const fingerprint = fingerprintOf(parsedBody);
   let serving = accountId;
   let switchedFrom;
-  // `AUTO_ACCOUNT` is the explicit opt-in to per-conversation routing; `null`
-  // is a pin to the default account and stays put.
-  if (accountId === undefined || accountId === AUTO_ACCOUNT) {
+
+  // An explicit request-level choice wins over routing, but only within what the
+  // token is allowed to reach. A token pinned to one account must not be able to
+  // name another: the pin is the operator's statement about whose subscription
+  // this token spends, and honouring the header there would turn any leaked
+  // token into access to every subscription.
+  const requested = requestedAccount(req.headers);
+  if (requested !== undefined) {
+    const pinned = accountId !== undefined && accountId !== AUTO_ACCOUNT && accountId !== null;
+    if (pinned && requested !== accountId) {
+      sendJson(res, 403, {
+        error: `this token is pinned to account ${accountId} and cannot spend ${requested}`,
+        code: 'ACCOUNT_NOT_PERMITTED',
+      });
+      return;
+    }
+    if (accounts !== undefined) {
+      // `require` resolves the default account and rejects an unknown or
+      // disabled one, so a disabled subscription cannot be drained by naming it.
+      try {
+        await accounts.require(requested);
+      } catch (error) {
+        sendJson(res, error?.code === 'ACCOUNT_DISABLED' ? 403 : 404, {
+          error: String(error?.message ?? error),
+          code: error?.code ?? 'UNKNOWN_ACCOUNT',
+        });
+        return;
+      }
+    }
+    // A named account is a deliberate override, so the conversation's binding is
+    // rewritten rather than merely bypassed; otherwise the next turn would
+    // silently drift back to the routed account.
+    serving = requested === DEFAULT_ACCOUNT_ID ? null : requested;
+    if (fingerprint !== undefined) bindings.set(fingerprint, serving);
+  } else if (accountId === undefined || accountId === AUTO_ACCOUNT) {
+    // `AUTO_ACCOUNT` is the explicit opt-in to per-conversation routing; `null`
+    // is a pin to the default account and stays put.
     const bound = bindings.get(fingerprint);
     if (bound !== undefined) {
       serving = bound;
