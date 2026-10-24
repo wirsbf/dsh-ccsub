@@ -564,6 +564,14 @@ export const ADMIN_STYLE = `
   /* An absent value is a deliberate empty, not a missing cell: a dash reads as
      "none" where a blank cell reads as a rendering bug. */
   .dash { color: var(--text-faint); }
+  /* The default account's row has one action and one explanation; stacking them
+     keeps the note under its button instead of letting flex squeeze the two
+     onto a single line at the far right edge. */
+  .action-stack { display: flex; flex-direction: column; align-items: flex-end; gap: var(--s-1); }
+  /* The note sits directly under its button and is capped so it never drags the
+     column wider than the button rows beside it. */
+  .action-note { font-size: var(--fs-caption); color: var(--text-faint); max-width: 11rem; text-align: right; line-height: 1.3; }
+  table.data td.actions .action-stack { margin-left: auto; }
   /* A link inside a table cell that should not look like a call to action. */
   .link-quiet { color: var(--text-muted); text-decoration: none; border-bottom: 1px dotted var(--border-strong); }
   .link-quiet:hover { color: var(--text); }

@@ -145,8 +145,7 @@ Pages (all redirect to unlock without a session):
 |---|---|
 | `/admin` | Unlock form, or a redirect to the overview |
 | `/admin/overview` | Sign-in state, quota windows, user count, relayed calls |
-| `/admin/accounts` | The subscriptions this server serves; per-account sign-in |
-| `/admin/account` | Claude sign-in, grant state, console session |
+| `/admin/accounts` | The subscriptions this server serves; per-account sign-in (old `/admin/account` redirects here) |
 | `/admin/users` | Add, disable, and remove users |
 | `/admin/usage` | Token accounting for relayed traffic |
 | `/admin/models` | The model catalog this subscription can call |

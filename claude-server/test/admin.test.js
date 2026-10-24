@@ -106,24 +106,27 @@ test('the lock page renders a login form and no management UI', () => {
 
 test('an unlocked page renders the management UI and the navigation', () => {
   const html = renderConsolePage({
-    page: 'account',
+    page: 'accounts',
     signedIn: true,
     mode: 'proxy',
     expiresAt: 1_700_000_000_000,
     cliVersion: '2.1.303',
+    accounts: [accountRow({ id: 'default', name: 'Default account', default: true })],
+    users: [],
   });
-  assert.match(html, /Start sign-in/);
   assert.match(html, /Sign out of console/);
   // The bearer input belongs to the lock page only.
   assert.doesNotMatch(html, /id="bearer"/);
-  // The shared shell carries all five destinations.
-  for (const label of ['Overview', 'Account', 'Users', 'Usage', 'Models']) {
+  // The shared shell carries every destination. `Account` is deliberately gone:
+  // it described a single subscription and the Accounts page supersedes it.
+  for (const label of ['Overview', 'Accounts', 'Users', 'Usage', 'Models']) {
     assert.match(html, new RegExp(`>${label}<`));
   }
+  assert.doesNotMatch(html, /href="\/admin\/account"/, 'the retired Account page is not linked');
 });
 
 test('the console never renders token material', () => {
-  for (const page of ['overview', 'account', 'users', 'usage', 'models']) {
+  for (const page of ['overview', 'accounts', 'users', 'usage', 'models']) {
     const html = renderConsolePage({
       page,
       signedIn: true,
@@ -226,7 +229,7 @@ test('every console page renders with a session', async () => {
     const cookie = await unlock(s);
     for (const [path, marker] of [
       ['/admin/overview', 'Relayed calls'],
-      ['/admin/account', 'Claude grant'],
+      ['/admin/accounts', 'Sign in'],
       ['/admin/users', 'Add user'],
       ['/admin/usage', 'Token accounting'],
       ['/admin/models', 'Model catalog'],
@@ -235,6 +238,11 @@ test('every console page renders with a session', async () => {
       assert.equal(res.status, 200, `${path} must render`);
       assert.match(await res.text(), new RegExp(marker));
     }
+    // The retired Account page redirects to its successor rather than 404ing,
+    // so a bookmark still lands somewhere useful.
+    const retired = await fetch(`${s.base}/admin/account`, { headers: { cookie }, redirect: 'manual' });
+    assert.equal(retired.status, 302, 'the retired page redirects');
+    assert.equal(retired.headers.get('location'), '/admin/accounts');
   } finally {
     await s.close();
   }
@@ -888,7 +896,7 @@ test('every console page renders without throwing', () => {
     accounts: [accountRow({ id: 'default', default: true })],
     usage: { totals: { calls: 0 }, byModel: [], recent: [] },
   };
-  for (const page of ['overview', 'accounts', 'account', 'users', 'usage', 'models']) {
+  for (const page of ['overview', 'accounts', 'users', 'usage', 'models']) {
     const html = renderConsolePage({ page, ...options });
     assert.ok(html.length > 500, `${page} should render a full page`);
     assert.match(html, /<html/, `${page} should be a document`);

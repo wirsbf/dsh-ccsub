@@ -58,11 +58,24 @@ export const ADMIN_HOME = `${ADMIN_PREFIX}/overview`;
 export const CONSOLE_PAGES = [
   { id: 'overview', path: `${ADMIN_PREFIX}/overview`, label: 'Overview' },
   { id: 'accounts', path: `${ADMIN_PREFIX}/accounts`, label: 'Accounts' },
-  { id: 'account', path: `${ADMIN_PREFIX}/account`, label: 'Account' },
   { id: 'users', path: `${ADMIN_PREFIX}/users`, label: 'Users' },
   { id: 'usage', path: `${ADMIN_PREFIX}/usage`, label: 'Usage' },
   { id: 'models', path: `${ADMIN_PREFIX}/models`, label: 'Models' },
 ];
+
+/**
+ * Paths that used to be pages and now resolve elsewhere.
+ *
+ * `/admin/account` described the single subscription a server used to hold. The
+ * Accounts page supersedes it, so a bookmark or an older link lands on the list
+ * rather than on a 404.
+ */
+const RETIRED_PATHS = new Map([[`${ADMIN_PREFIX}/account`, `${ADMIN_PREFIX}/accounts`]]);
+
+/** Where a retired path should send the browser, or undefined. */
+export function redirectForPath(pathname) {
+  return RETIRED_PATHS.get(pathname);
+}
 
 /** The page id for a path, or undefined. */
 export function pageForPath(pathname) {
@@ -217,10 +230,6 @@ const PAGE_META = {
   accounts: {
     title: 'Accounts',
     subtitle: 'The Claude subscriptions this server serves. Each has its own sign-in and quota.',
-  },
-  account: {
-    title: 'Account',
-    subtitle: 'Claude sign-in and grant state for the default account.',
   },
   users: {
     title: 'Users',
@@ -427,7 +436,7 @@ export function renderLockPage(options = {}) {
 // --- page bodies -----------------------------------------------------------
 
 function overviewBody(options) {
-  const { signedIn, expiresAt, mode, cliVersion, users } = options;
+  const { signedIn, expiresAt, mode, cliVersion, users, identity } = options;
   const enabled = Array.isArray(users) ? users.filter((user) => user.disabled !== true).length : 0;
   const total = Array.isArray(users) ? users.length : 0;
   const accountList = Array.isArray(options.accounts) ? options.accounts : [];
@@ -486,32 +495,6 @@ function overviewBody(options) {
           actions: `<a class="hint" href="${ADMIN_PREFIX}/usage">All usage</a>`,
         },
       )}
-      <p class="note">Upstream mode <code>${esc(mode)}</code> · claimed CLI version <code>${esc(cliVersion)}</code>.</p>`;
-}
-
-function accountBody(options) {
-  const { signedIn, expiresAt, mode, cliVersion, identity } = options;
-  return `${pageHead('account')}
-      ${card(
-        'Claude grant',
-        facts([
-          ['Signed in', signedIn ? pill('signed in', 'on') : pill('not signed in', 'off')],
-          ['Access expires', esc(signedIn ? stamp(expiresAt) : '—')],
-          ['Upstream mode', `<code>${esc(mode)}</code>`],
-          ['Claimed CLI version', `<code>${esc(cliVersion)}</code>`],
-        ]),
-      )}
-      ${card(
-        'Sign in to Claude',
-        `<p class="hint">Opens Anthropic's authorize page in a new tab. After you approve, the
-          browser lands on a <code>localhost</code> address that is not served — copy that full
-          address from the bar and paste it below, or paste the code and state.</p>
-        <div class="row" id="login-actions">
-          <button class="primary" id="start" type="button">Start sign-in</button>
-          <button id="cancel" type="button" disabled>Cancel pending</button>
-        </div>
-        <div id="stage"></div>`,
-      )}
       ${card(
         'Console session',
         facts([
@@ -522,12 +505,14 @@ function accountBody(options) {
               ? 'The environment bearer (<code>CLIENT_BEARER</code>)'
               : 'A stored admin user',
           ],
+          ['Upstream mode', `<code>${esc(mode)}</code>`],
+          ['Claimed CLI version', `<code>${esc(cliVersion)}</code>`],
         ]),
         {
           actions: `<button class="danger small" id="signout-account" type="button">${ICONS.signout}Sign out</button>`,
         },
       )}
-      <p class="note">Signing out ends this browser session only. The Claude grant and every user token stay on the server.</p>`;
+      <p class="note">Signing out ends this browser session only. The Claude subscriptions and every user token stay on the server.</p>`;
 }
 
 function usersBody(options) {
@@ -676,8 +661,10 @@ function accountsBody(options) {
         )}" aria-label="Sign in account ${esc(account.name)}"${disabled ? ' disabled' : ''}>Sign in</button>`;
       // The default account is GRANT_PATH: renaming it would imply a rename that
       // cannot happen, and removing it would strand the deployment's own grant.
+      // So its cell holds the one action it has and a caption, not a pair of
+      // buttons that would be refused.
       const actions = isDefault
-        ? `${signIn}<span class="hint">fixed by GRANT_PATH</span>`
+        ? `<div class="action-stack">${signIn}<span class="action-note">Identity fixed by GRANT_PATH</span></div>`
         : `<button class="small" type="button" data-action="rename" data-id="${esc(
             account.id,
           )}" data-name="${esc(account.name)}" aria-label="Rename account ${esc(account.name)}">Rename</button>` +
@@ -814,9 +801,7 @@ export function renderConsolePage(options = {}) {
       ? overviewBody(options)
       : page === 'accounts'
         ? accountsBody(options)
-        : page === 'account'
-          ? accountBody(options)
-          : page === 'users'
+        : page === 'users'
             ? usersBody(options)
             : page === 'usage'
               ? usageBody(options)

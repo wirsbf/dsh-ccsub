@@ -36,6 +36,7 @@ import {
   AdminSessions,
   cookieOf,
   pageForPath,
+  redirectForPath,
   renderConsolePage,
   renderLockPage,
 } from './admin.js';
@@ -276,6 +277,18 @@ export function createServer(options) {
         return;
       }
       sendRedirect(res, ADMIN_HOME);
+      return;
+    }
+
+    // A retired page path redirects instead of 404ing: the URL may be a
+    // bookmark, and landing on the successor is friendlier than a dead end.
+    const retired = req.method === 'GET' ? redirectForPath(pathname) : undefined;
+    if (retired !== undefined) {
+      if (!signedIn) {
+        sendRedirect(res, ADMIN_PREFIX);
+        return;
+      }
+      sendRedirect(res, retired);
       return;
     }
 
