@@ -28,6 +28,8 @@
  * @module claude-server/usage
  */
 
+import { costOf } from './pricing.js';
+
 /** How many recent calls to keep for inspection. */
 const MAX_RECENT = 50;
 
@@ -226,8 +228,16 @@ export class UsageLedger {
   constructor() {
     this.totals = emptyTotals();
     this.byModel = new Map();
+    // Who and which subscription the traffic belongs to. Both dimensions are
+    // kept because they answer different questions: `byUser` is "who spent
+    // this", `byAccount` is "which subscription paid for it".
+    this.byUser = new Map();
+    this.byAccount = new Map();
     this.recent = [];
     this.since = Date.now();
+    this.costUsd = 0;
+    /** Model ids the price table does not know, so the console can say so. */
+    this.unpricedModels = new Set();
   }
 
   /**
@@ -239,12 +249,47 @@ export class UsageLedger {
     this.totals.calls += 1;
     accumulate(this.totals, entry);
     const model = typeof entry.model === 'string' && entry.model.length > 0 ? entry.model : undefined;
+
+    // The API-equivalent value of this one call. Unknown models contribute no
+    // figure but are named, so the console can say which ones it could not price
+    // rather than quietly under-reporting the total.
+    const cost = costOf(entry, model);
+    if (cost === undefined) {
+      if (model !== undefined) this.unpricedModels.add(model);
+    } else {
+      this.costUsd += cost;
+    }
+
     if (model !== undefined) {
       const bucket = this.byModel.get(model) ?? emptyTotals();
       bucket.calls += 1;
       accumulate(bucket, entry);
+      bucket.costUsd = (bucket.costUsd ?? 0) + (cost ?? 0);
       this.byModel.set(model, bucket);
     }
+
+    // Attribute the call. A missing identity (older embedders, the bootstrap
+    // bearer before users existed) is bucketed as `legacy` rather than dropped:
+    // dropping it would make per-user totals not add up to the whole.
+    const userKey = typeof entry.userId === 'string' && entry.userId.length > 0 ? entry.userId : 'legacy';
+    const userName = typeof entry.userName === 'string' && entry.userName.length > 0 ? entry.userName : userKey;
+    const accountKey =
+      typeof entry.accountId === 'string' && entry.accountId.length > 0 ? entry.accountId : 'default';
+    // `label` is the human-readable name; `key` stays the id. The console shows
+    // the label and falls back to the id only when no name is known.
+    const bucket = this.byUser.get(userKey) ?? { label: userName, ...emptyTotals(), costUsd: 0 };
+    bucket.label = userName;
+    bucket.calls += 1;
+    accumulate(bucket, entry);
+    bucket.costUsd += cost ?? 0;
+    this.byUser.set(userKey, bucket);
+
+    const accountBucket = this.byAccount.get(accountKey) ?? { label: accountKey, ...emptyTotals(), costUsd: 0 };
+    // The relay knows the account id; the console maps it to a name.
+    accountBucket.calls += 1;
+    accumulate(accountBucket, entry);
+    accountBucket.costUsd += cost ?? 0;
+    this.byAccount.set(accountKey, accountBucket);
     this.recent.unshift({
       at: Date.now(),
       model: model ?? null,
@@ -271,6 +316,19 @@ export class UsageLedger {
           (a, b) =>
             b.input_tokens + b.output_tokens - (a.input_tokens + a.output_tokens),
         ),
+      // Per-user and per-account attribution. Sorted by value rather than by
+      // key so the expensive rows surface first, which is what an operator
+      // looking at this page wants to see.
+      byUser: [...this.byUser.entries()]
+        .map(([userId, bucket]) => ({ userId, ...bucket }))
+        .sort((a, b) => b.costUsd - a.costUsd),
+      byAccount: [...this.byAccount.entries()]
+        .map(([accountId, bucket]) => ({ accountId, ...bucket }))
+        .sort((a, b) => b.costUsd - a.costUsd),
+      /** API-equivalent USD for all priced traffic. */
+      costUsd: this.costUsd,
+      /** Models the price table could not price; their tokens are not counted. */
+      unpricedModels: [...this.unpricedModels],
       recent: [...this.recent],
       // Stated wherever the numbers appear: this is process memory, so a
       // restart starts from zero.
@@ -282,7 +340,11 @@ export class UsageLedger {
   reset() {
     this.totals = emptyTotals();
     this.byModel.clear();
+    this.byUser.clear();
+    this.byAccount.clear();
     this.recent = [];
     this.since = Date.now();
+    this.costUsd = 0;
+    this.unpricedModels.clear();
   }
 }

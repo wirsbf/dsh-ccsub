@@ -162,15 +162,25 @@ function normalizeDisabled(raw) {
 }
 
 /**
+ * The account id that means "no fixed account; route each conversation".
+ *
+ * Distinct from `null`, which pins a token to the default account. A token that
+ * follows the pool can move between subscriptions; one pinned to the default
+ * cannot, which is what keeps the bootstrap bearer where the operator put it.
+ */
+export const AUTO_ACCOUNT = 'auto';
+
+/**
  * Validate the account a token spends.
  *
- * `undefined` and `null` both mean the default account. The id's *existence* is
- * checked by the caller that owns the account directory: this module cannot see
- * that file, and inventing a second source of truth here would let the two
- * disagree.
+ * `undefined` and `null` both mean the default account; `"auto"` opts into
+ * per-conversation routing. The id's *existence* is checked by the caller that
+ * owns the account directory: this module cannot see that file, and inventing a
+ * second source of truth here would let the two disagree.
  */
 function normalizeAccountId(raw) {
   if (raw === undefined || raw === null) return null;
+  if (raw === AUTO_ACCOUNT) return AUTO_ACCOUNT;
   if (typeof raw !== 'string' || raw.trim().length === 0) {
     throw new UsersError('"accountId" must be a non-empty string or null', 'INVALID_ACCOUNT');
   }
@@ -208,7 +218,9 @@ function normalizeStoredUser(record, index) {
   // accounts existed resolves to the grant that was the only one at the time,
   // so an upgrade must not invalidate them. A present value must be a usable id.
   if (accountId !== undefined && accountId !== null) {
-    if (typeof accountId !== 'string' || !/^[a-z0-9_]{1,40}$/.test(accountId)) {
+    if (accountId === AUTO_ACCOUNT) {
+      // Valid: this token follows the pool rather than one account.
+    } else if (typeof accountId !== 'string' || !/^[a-z0-9_]{1,40}$/.test(accountId)) {
       throw new UsersError(`the user file entry ${index} has an unusable account id`, 'USERS_CORRUPT');
     }
   }

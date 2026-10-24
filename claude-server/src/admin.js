@@ -775,7 +775,13 @@ function usageBody(options) {
           actions: `<span class="hint" id="tokens-since"></span><button class="small" id="refresh-usage-tokens" type="button">Refresh</button>`,
         },
       )}
-      <p class="note">Counted from responses relayed by this process and reset when it restarts.</p>`;
+      ${card('By user', '<div id="by-user-body"><p class="empty">Loading…</p></div>')}
+      ${card('By account', '<div id="by-account-body"><p class="empty">Loading…</p></div>')}
+      <p class="note">Counted from responses relayed by this process and reset when it restarts.
+        The dollar column is the <strong>API-equivalent</strong> value of the traffic — what these
+        tokens would have cost on pay-as-you-go pricing. This server runs on a subscription, so
+        nothing here is billed per token; the figure is a way to compare one user or account
+        against another.</p>`;
 }
 
 function modelsBody(options) {
@@ -1153,8 +1159,13 @@ const CONSOLE_SCRIPT = `
     if (tokensSince && data) tokensSince.textContent = 'since ' + new Date(data.since).toLocaleString();
   };
 
+  var byUserBody = document.getElementById('by-user-body');
+  var byAccountBody = document.getElementById('by-account-body');
+  // Account ids arrive from the usage API; the names were rendered server-side.
+  var ACCOUNT_NAMES = window.__ACCOUNT_NAMES__ || {};
+
   var loadTokens = function (quiet) {
-    if (!tokensBody && !recentBody && !tileCalls) return;
+    if (!tokensBody && !recentBody && !tileCalls && !byUserBody && !byAccountBody) return;
     if (tokensSince && !quiet) tokensSince.textContent = 'loading…';
     get('/admin/api/usage').then(function (result) {
       if (!result.ok) {
@@ -1170,9 +1181,89 @@ const CONSOLE_SCRIPT = `
       }
       renderTokens(result.body);
       renderRecent(result.body);
+      renderAttribution(
+        byUserBody,
+        result.body.byUser,
+        'No relayed calls yet.',
+        function (row) { return row.label || row.userId; }
+      );
+      renderAttribution(
+        byAccountBody,
+        result.body.byAccount,
+        'No relayed calls yet.',
+        function (row) {
+          if (row.accountId === 'default') return 'Default account';
+          return row.label || ACCOUNT_NAMES[row.accountId] || row.accountId;
+        }
+      );
     }).catch(function (error) {
       if (tokensSince) tokensSince.textContent = String(error && error.message ? error.message : error);
     });
+  };
+
+
+  /**
+   * One attribution table: a label, calls, tokens, and API-equivalent cost.
+   * Shared by the per-user and per-account cards so the two cannot drift.
+   */
+  var renderAttribution = function (node, rows, emptyText, labelOf) {
+    if (!node) return;
+    node.textContent = '';
+    if (!rows || rows.length === 0) {
+      var p = document.createElement('p');
+      p.className = 'empty';
+      p.textContent = emptyText;
+      node.append(p);
+      return;
+    }
+    var wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+    var table = document.createElement('table');
+    table.className = 'data';
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['Name', 'Calls', 'Input', 'Output', 'Cache read', 'Cache write', 'API value']
+      .forEach(function (label, index) {
+        var th = document.createElement('th');
+        th.textContent = label;
+        if (index > 0) th.className = 'num';
+        headRow.append(th);
+      });
+    thead.append(headRow);
+    table.append(thead);
+
+    var tbody = document.createElement('tbody');
+    rows.forEach(function (row) {
+      var tr = document.createElement('tr');
+      var name = document.createElement('td');
+      name.className = 'strong';
+      name.textContent = labelOf(row);
+      tr.append(name);
+      [
+        row.calls || 0,
+        row.input_tokens || 0,
+        row.output_tokens || 0,
+        row.cache_read_input_tokens || 0,
+        row.cache_creation_input_tokens || 0
+      ].forEach(function (value) {
+        var td = document.createElement('td');
+        td.className = 'num';
+        td.textContent = Number(value).toLocaleString();
+        tr.append(td);
+      });
+      var cost = document.createElement('td');
+      cost.className = 'num strong';
+      // Four decimals keeps a cheap model's traffic visible instead of
+      // rendering every small row as $0.00.
+      cost.textContent = typeof row.costUsd === 'number'
+        ? (row.costUsd < 1 ? '$' + row.costUsd.toFixed(4) : '$' + row.costUsd.toFixed(2))
+        : '—';
+      tr.append(cost);
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    wrap.append(table);
+    node.append(wrap);
   };
 
   // ---- Models page --------------------------------------------------------
@@ -1774,7 +1865,7 @@ const CONSOLE_SCRIPT = `
   };
 
   if (usageBody) loadUsage();
-  if (tokensBody || recentBody || tileCalls) loadTokens(true);
+  if (tokensBody || recentBody || tileCalls || byUserBody || byAccountBody) loadTokens(true);
   if (modelsBody) loadModels();
 })();
 `;

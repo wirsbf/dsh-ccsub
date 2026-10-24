@@ -133,6 +133,15 @@ export class AccountDirectory {
   #cache;
   #stores = new Map();
   #mutationChain = Promise.resolve();
+  /**
+   * Bookkeeping writes still in flight.
+   *
+   * `accessToken` records `lastUsedAt` without making the caller wait, because a
+   * request that already has a token must not fail on a timestamp. The cost is
+   * that the write can land after the caller is done with the directory, so it
+   * is tracked here and awaited by `drain()`.
+   */
+  #pendingBookkeeping = new Set();
 
   /**
    * @param options - `path` (`accounts.json`), `grantsDir` (one file per
@@ -456,7 +465,9 @@ export class AccountDirectory {
     // Record freshness for the console's per-account ordering. Best effort: a
     // failed bookkeeping write must not fail a request that already has a token.
     if (key !== DEFAULT_ACCOUNT_ID) {
-      void this.#touch(key);
+      const bookkeeping = this.#touch(key);
+      this.#pendingBookkeeping.add(bookkeeping);
+      void bookkeeping.finally(() => this.#pendingBookkeeping.delete(bookkeeping));
     }
     return token;
   }
@@ -474,8 +485,94 @@ export class AccountDirectory {
     }
   }
 
+  /**
+   * Wait for bookkeeping writes to settle.
+   *
+   * Called by the server's dispose so a `lastUsedAt` write cannot outlive the
+   * server and land on a directory the caller is removing.
+   */
+  async drain() {
+    await Promise.allSettled([...this.#pendingBookkeeping]);
+  }
+
   /** Forget the memoized directory file so the next read hits disk. */
   invalidate() {
     this.#cache = undefined;
   }
+}
+
+/**
+ * How much room an account has in its short window, as a routing score.
+ *
+ * The 5-hour window is what interrupts a conversation, so it outranks the
+ * weekly one: a session that starts on an account with 95% of its five-hour
+ * budget already spent will be cut off within the hour, and switching then
+ * throws away every cached token in the conversation.
+ *
+ * The score is `remaining percent`, and when two accounts are equally roomy the
+ * one that resets *sooner* wins, because its room is about to be replenished
+ * rather than spent.
+ * @param usage - the upstream usage payload for this account.
+ * @returns the score, or undefined when the payload has no session window.
+ */
+export function sessionHeadroom(usage) {
+  const limits = Array.isArray(usage?.limits) ? usage.limits : [];
+  const session = limits.find((row) => row?.kind === 'session');
+  const percent = session === undefined ? undefined : Number(session.percent);
+  if (!Number.isFinite(percent)) return undefined;
+  // `resets_at` is the moment the window refills; earlier is better at equal
+  // headroom because less of the current budget has to last.
+  const resetsAt = session.resets_at === undefined ? undefined : Date.parse(session.resets_at);
+  return {
+    remaining: Math.max(0, 100 - percent),
+    resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined,
+  };
+}
+
+/**
+ * Order accounts best-first for starting a new conversation.
+ *
+ * Signed-in, enabled accounts only: a signed-out or disabled account cannot
+ * serve a request at all, so including it would just move the failure later.
+ * Accounts with unknown headroom rank after known ones but ahead of exhausted
+ * ones — an account whose usage probe has not run yet is a guess, while an
+ * account at 100% is a certainty.
+ * @param accounts - rows from `list()`.
+ * @param headroomOf - maps an account id to `sessionHeadroom` output (or undefined).
+ * @returns the account ids, best first.
+ */
+export function rankForNewSession(accounts, headroomOf) {
+  const rows = [];
+  for (const account of Array.isArray(accounts) ? accounts : []) {
+    if (account.signedIn !== true || account.disabled === true) continue;
+    const headroom = headroomOf(account.id);
+    rows.push({
+      id: account.id,
+      remaining: headroom === undefined ? undefined : headroom.remaining,
+      resetsAt: headroom === undefined ? undefined : headroom.resetsAt,
+    });
+  }
+  rows.sort((a, b) => {
+    // An account whose headroom is known and *positive* outranks an unknown
+    // one; an unknown one still outranks a known-empty one, because unknown is
+    // merely a guess while empty is a certainty. Treating unknown as simply
+    // "last" would push it behind an account that cannot serve at all.
+    const aRoom = a.remaining !== undefined && a.remaining > 0;
+    const bRoom = b.remaining !== undefined && b.remaining > 0;
+    if (aRoom !== bRoom) return aRoom ? -1 : 1;
+    // Neither has known room. An unknown account is a better bet than one known
+    // to be empty, so unknown goes first.
+    const aKnown = a.remaining !== undefined;
+    const bKnown = b.remaining !== undefined;
+    if (aKnown !== bKnown) return aKnown ? 1 : -1;
+    if (a.remaining !== undefined && b.remaining !== undefined && a.remaining !== b.remaining) {
+      return b.remaining - a.remaining;
+    }
+    // Equal room: prefer the window that refills soonest.
+    const ar = a.resetsAt ?? Infinity;
+    const br = b.resetsAt ?? Infinity;
+    if (ar !== br) return ar - br;
+    return a.id.localeCompare(b.id);
+  });
+  return rows.map((row) => row.id);
 }

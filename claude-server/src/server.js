@@ -40,15 +40,22 @@ import {
   renderConsolePage,
   renderLockPage,
 } from './admin.js';
-import { AccountDirectory, AccountsError, DEFAULT_ACCOUNT_ID } from './accounts.js';
+import {
+  AccountDirectory,
+  AccountsError,
+  DEFAULT_ACCOUNT_ID,
+  rankForNewSession,
+  sessionHeadroom,
+} from './accounts.js';
 import { ClientAuth } from './auth.js';
 import { THINKING_BETAS, ensureBaseBetas, wantsThinkingBetas, withClaudeIdentity } from './identity.js';
 import { LoginSessions } from './login.js';
+import { SessionBindings, fingerprintOf } from './sessions.js';
 import { exchangeCode, parseAuthorizationInput, refreshGrant } from './oauth.js';
 import { sanitizeBody } from './sanitize.js';
 import { hasJsonBody, upstreamFor } from './upstream.js';
 import { UsageLedger, UsageObserver } from './usage.js';
-import { UserDirectory, UsersError } from './users.js';
+import { AUTO_ACCOUNT, UserDirectory, UsersError } from './users.js';
 
 /** Responses must never be cached by an intermediary. */
 const NO_STORE = 'no-store';
@@ -157,6 +164,14 @@ export function createServer(options) {
   // Token accounting for relayed model traffic. Process memory only: see
   // src/usage.js for why it is not persisted.
   const usageLedger = new UsageLedger();
+  /**
+   * Which conversation runs on which subscription.
+   *
+   * In memory, like the usage ledger: a restart re-binds each in-flight
+   * conversation on its next turn, which costs one cache write and keeps
+   * routing state out of the grant volume.
+   */
+  const bindings = new SessionBindings();
   const quotaCache = { at: 0, usage: undefined, error: undefined };
   const QUOTA_CACHE_MS = 5 * 60_000;
   const maxBodyBytes = config.maxBodyBytes ?? 32 * 1024 * 1024;
@@ -185,6 +200,142 @@ export function createServer(options) {
   };
   /** The grant store for one account, or the injected single store. */
   const storeFor = (accountId) => (accounts !== undefined ? accounts.store(accountId) : grants);
+
+  /**
+   * Per-account 5-hour headroom, cached briefly.
+   *
+   * The usage endpoint is rate-limited far more aggressively than messages
+   * (its 429s persist), so this cannot be called per request. A short cache is
+   * enough because the routing decision only needs "roughly how much room is
+   * left" at the moment a conversation starts, and the 429 path corrects it
+   * immediately when a guess turns out wrong.
+   */
+  const headroomCache = new Map();
+  const HEADROOM_TTL_MS = 60_000;
+  /** A background usage probe gives up after this long. */
+  const HEADROOM_PROBE_TIMEOUT_MS = 5_000;
+  /** Account ids known to have run out, with the moment their window resets. */
+  const exhausted = new Map();
+  /**
+   * Probes still in flight. Disposal aborts them: a background probe that
+   * outlives the server touches the grant volume after shutdown, which shows up
+   * as a scratch directory that cannot be removed and as work happening on a
+   * closed server.
+   */
+  const inflightProbes = new Set();
+  let closing = false;
+
+  const headroomOf = (accountId) => {
+    const entry = headroomCache.get(accountId);
+    if (entry === undefined) return undefined;
+    if (Date.now() - entry.at > HEADROOM_TTL_MS) return undefined;
+    return entry.value;
+  };
+
+  /**
+   * Refresh one account's headroom if the cache is stale or absent.
+   * Best effort: a failure leaves the previous value (or none), which the
+   * ranking treats as "unknown" rather than as "empty".
+   */
+  const refreshHeadroom = async (accountId) => {
+    if (closing) return;
+    if (headroomOf(accountId) !== undefined) return;
+    const probe = (async () => {
+    try {
+      const token = await accessToken(accountId);
+      const target = upstreamFor('/api/oauth/usage', '');
+      const headers = withClaudeIdentity(
+        { accept: 'application/json', 'anthropic-version': '2023-06-01' },
+        config.claudeCliVersion,
+        config.stainlessRuntimeVersion,
+      );
+      headers.set('authorization', `Bearer ${token}`);
+      ensureBaseBetas(headers);
+      headers.delete('host');
+      // Bounded: this runs in the background, so a hung probe must not pin a
+      // pending promise forever.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), HEADROOM_PROBE_TIMEOUT_MS);
+      try {
+        const response = await transport.request(target, {
+          method: 'GET',
+          headers: Object.fromEntries(headers.entries()),
+          signal: controller.signal,
+        });
+        if (response.statusCode !== 200) return;
+        const chunks = [];
+        for await (const chunk of response.body) chunks.push(chunk);
+        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        headroomCache.set(accountId, { at: Date.now(), value: sessionHeadroom(payload) });
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch {
+      // A probe failure is not a routing failure: it just leaves this account
+      // ranked as unknown.
+    }
+    })();
+    inflightProbes.add(probe);
+    try {
+      await probe;
+    } finally {
+      inflightProbes.delete(probe);
+    }
+  };
+
+  /**
+   * Choose the account for a conversation that has no binding yet.
+   *
+   * Ordering: the most 5-hour headroom, ties broken by the window that resets
+   * soonest. Accounts already known to be exhausted are skipped for the life of
+   * their window, so a conversation started after one fills up does not land on
+   * it again.
+   * @returns the account id, or null when nothing better than the default exists.
+   */
+  const chooseAccount = async () => {
+    if (accounts === undefined) return null;
+    let rows;
+    try {
+      rows = await accounts.list();
+    } catch {
+      return null;
+    }
+    // Never wait on a usage probe here: this runs in the request path, and the
+    // usage endpoint is both slow and rate-limited. The decision uses whatever
+    // headroom is already cached, and a probe is kicked off in the background
+    // for next time. An account with unknown headroom still ranks ahead of a
+    // known-exhausted one, so a cold cache degrades to "first usable account"
+    // rather than to a stall.
+    for (const row of rows) {
+      if (headroomOf(row.id) === undefined) void refreshHeadroom(row.id);
+    }
+    const now = Date.now();
+    const ranked = rankForNewSession(rows, headroomOf);
+    const usable = ranked.filter((id) => {
+      const until = exhausted.get(id);
+      if (until === undefined) return true;
+      if (until > now) return false;
+      // The window has reset; forget the mark.
+      exhausted.delete(id);
+      return true;
+    });
+    return usable.length === 0 ? null : usable[0];
+  };
+
+  /**
+   * Mark an account as out of quota for its current window.
+   *
+   * Called when upstream answers 429: that is the authoritative signal, ahead
+   * of any cached usage probe. The mark expires when the window resets, so a
+   * recovered account becomes selectable again without a manual step.
+   */
+  const markExhausted = (accountId, resetsAt) => {
+    if (typeof accountId !== 'string') return;
+    const until = typeof resetsAt === 'number' && Number.isFinite(resetsAt) ? resetsAt : Date.now() + 5 * 60_000;
+    exhausted.set(accountId, until);
+    headroomCache.set(accountId, { at: Date.now(), value: { remaining: 0, resetsAt: until } });
+    logger.warn('account %s is out of quota until %s', accountId, new Date(until).toISOString());
+  };
 
   /** Send an HTML reply. Always uncacheable: it reflects live credential state. */
   const sendHtml = (res, status, html) => {
@@ -884,9 +1035,18 @@ export function createServer(options) {
         accessToken,
         hosts,
         usageLedger,
-        // The account the caller's token is bound to. This is what makes two
-        // tokens on two accounts spend two different subscriptions.
-        accountId: identity?.accountId ?? null,
+        // The account the caller's token is bound to. `null` means "bound to the
+        // default account"; `undefined` means "not bound at all, route by
+        // session". The distinction is load-bearing: the bootstrap bearer is
+        // bound to the default account and must never be moved by routing.
+        accountId: identity === undefined ? undefined : identity.accountId,
+        identity,
+        // Session routing: the relay decides the account, so it needs the
+        // binding table and the chooser, both owned by this closure.
+        bindings,
+        chooseAccount,
+        markExhausted,
+        exhaustedUntilOf,
       });
     })().catch((error) => {
       logger.error('unhandled request failure: %s', String(error));
@@ -908,9 +1068,51 @@ export function createServer(options) {
     // running server never sees.
     accounts,
     async dispose() {
+      // Refuse new probes, then let the running ones settle: a probe that
+      // touches the grant volume after the caller has moved on is a leak, and
+      // it is what makes a scratch directory unremovable in tests.
+      closing = true;
+      await Promise.allSettled([...inflightProbes]);
+      // Bookkeeping writes (lastUsedAt) are fire-and-forget by design; wait for
+      // them before the caller removes the volume they land on.
+      if (accounts !== undefined) await accounts.drain();
       await new Promise((resolve) => server.close(() => resolve()));
     },
   };
+}
+
+/**
+ * When a 429 says the account's quota window refills.
+ *
+ * Anthropic reports the reset as either `retry-after` (seconds) or a
+ * `*-reset` timestamp header, and the exact name varies by limit kind. Each is
+ * tried in turn; if none is present the caller falls back to a short cooldown,
+ * which is still better than retrying an account that just refused.
+ * @param headers - the upstream response headers.
+ * @returns epoch milliseconds, or undefined.
+ */
+function exhaustedUntilOf(headers) {
+  if (headers === null || typeof headers !== 'object') return undefined;
+  const retryAfter = Number(headers['retry-after']);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Date.now() + retryAfter * 1000;
+  for (const name of [
+    'anthropic-ratelimit-unified-5h-reset',
+    'anthropic-ratelimit-unified-reset',
+    'anthropic-ratelimit-requests-reset',
+    'anthropic-ratelimit-tokens-reset',
+  ]) {
+    const raw = headers[name];
+    if (raw === undefined) continue;
+    // Some resets arrive as epoch seconds, others as an HTTP date.
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      // A bare number below 1e12 is seconds, not milliseconds.
+      return numeric < 1e12 ? numeric * 1000 : numeric;
+    }
+    const parsed = Date.parse(String(raw));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
 }
 
 /**
@@ -921,7 +1123,19 @@ export function createServer(options) {
  * back byte for byte with its framing headers intact.
  */
 async function relay(req, res, ctx) {
-  const { config, transport, logger, accessToken, usageLedger, accountId } = ctx;
+  const {
+    config,
+    transport,
+    logger,
+    accessToken,
+    usageLedger,
+    accountId,
+    identity,
+    bindings,
+    chooseAccount,
+    markExhausted,
+    exhaustedUntilOf,
+  } = ctx;
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   const target = upstreamFor(url.pathname, url.search, ctx.hosts ?? {});
 
@@ -954,9 +1168,41 @@ async function relay(req, res, ctx) {
     }
   }
 
+  /**
+   * Which subscription serves this request.
+   *
+   * A token bound to an account still pins it — that is an explicit operator
+   * decision. An unbound token (`accountId == null`) is routed by conversation:
+   * the first turn picks the roomiest account, and every later turn of the same
+   * conversation follows the binding so its prompt cache keeps hitting.
+   *
+   * Moving a live conversation to another account is the one thing this must
+   * never do casually: cache is per credential, so a hop turns every subsequent
+   * turn into a full cache write instead of a cache read.
+   */
+  // Two different absences: a token explicitly bound to the *default* account
+  // carries `accountId: null` and must stay there, while a token with no binding
+  // at all (`undefined`) is eligible for session routing. Collapsing them would
+  // silently move the bootstrap bearer off the default account.
+  const fingerprint = fingerprintOf(parsedBody);
+  let serving = accountId;
+  let switchedFrom;
+  // `AUTO_ACCOUNT` is the explicit opt-in to per-conversation routing; `null`
+  // is a pin to the default account and stays put.
+  if (accountId === undefined || accountId === AUTO_ACCOUNT) {
+    const bound = bindings.get(fingerprint);
+    if (bound !== undefined) {
+      serving = bound;
+    } else {
+      serving = await chooseAccount();
+      if (serving === undefined) serving = null;
+      switchedFrom = undefined;
+    }
+  }
+
   let token;
   try {
-    token = await accessToken(accountId);
+    token = await accessToken(serving);
   } catch (error) {
     const code = error?.code ?? 'TOKEN_UNAVAILABLE';
     // Three distinct refusals, three distinct statuses: the account itself is
@@ -1020,6 +1266,25 @@ async function relay(req, res, ctx) {
       requestId === undefined ? '' : ` request-id=${requestId}`,
       retry === undefined ? '' : ` should-retry=${retry}`,
     );
+
+    if (upstream.statusCode === 429) {
+      // The authoritative "this account is done" signal, ahead of any cached
+      // usage probe. Marking it here is what stops the *next* conversation from
+      // being started on an account that will immediately refuse it.
+      markExhausted(serving, exhaustedUntilOf(upstream.headers));
+      // A binding to an account that just ran out must be dropped, so the next
+      // turn can move. This is the one place where moving costs less than
+      // staying: staying cannot succeed at all.
+      if (fingerprint !== undefined) bindings.delete(fingerprint);
+    } else if (upstream.statusCode < 500 && fingerprint !== undefined && typeof serving === 'string') {
+      // Bind only on a response the account actually served. A 4xx that is not
+      // a rate limit (a bad request, a validation error) says nothing about
+      // whether this account is the right one to keep using.
+      bindings.set(fingerprint, serving);
+      if (switchedFrom !== undefined) {
+        logger.info('session moved from account %s to %s after a quota limit', switchedFrom, serving);
+      }
+    }
   }
 
   // Headers are copied from the upstream response, with one deliberate
@@ -1092,7 +1357,18 @@ async function relay(req, res, ctx) {
     // break was still consumed from the subscription.
     const accounting = observer?.finish();
     if (accounting !== undefined) {
-      usageLedger.record({ ...accounting, durationMs: Date.now() - startedAt });
+      usageLedger.record({
+        ...accounting,
+        durationMs: Date.now() - startedAt,
+        // Attribution: who spent it, and which subscription paid. Both are
+        // carried into the ledger so the console can answer "who costs me the
+        // most" and "which account is being drained" separately.
+        userId: identity?.id,
+        userName: identity?.name,
+        // The account that *served* the call, not the token's declared binding:
+        // an `auto` token is attributed to the subscription it actually spent.
+        accountId: typeof serving === 'string' ? serving : null,
+      });
     }
   }
 }

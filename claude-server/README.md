@@ -42,6 +42,57 @@ volume as the grant. A missing file means "no users yet"; a corrupt one stops
 stored users from authenticating but leaves the legacy bearer working, so a bad
 user file cannot lock the operator out of the relay.
 
+## Routing and cost
+
+### Which subscription serves a request
+
+A token either pins an account or follows the pool:
+
+| Token's `accountId` | Behaviour |
+|---|---|
+| `null` / absent | Pinned to the **default** account (`GRANT_PATH`). The bootstrap bearer is always this. |
+| a concrete id | Pinned to that account. |
+| `"auto"` | **Routed per conversation**: the roomiest signed-in account serves it. |
+
+Routing is by **conversation, not by request**. The first turn of a conversation
+picks an account; every later turn stays on it. This is not an optimisation, it
+is the cost model: prompt cache is per credential, so a conversation that hops
+accounts pays a full cache write (1.25x input) on every turn instead of a cache
+read (0.1x) — roughly twelve times the cost.
+
+A conversation is identified from the parts of the request body that stay fixed
+for its life: `system`, `tools`, and `messages[0]`. Later turns append to
+`messages`, so keying on the first message is what makes every turn of one
+conversation produce the same key. Two conversations with identical system
+prompt, tools, and opening message are indistinguishable — and share a cache
+anyway, so treating them as one costs nothing.
+
+### Choosing the account
+
+The **five-hour window** decides, not the weekly one: it is what interrupts a
+conversation mid-flight. The account with the most remaining five-hour headroom
+wins; ties go to the window that resets soonest, because its room is about to be
+replenished.
+
+An account is marked exhausted when upstream answers `429`, and its conversation
+binding is dropped so the next turn can move. The mark expires when the window
+resets. Usage probes are cached for a minute and never block a request.
+
+### API-equivalent cost
+
+`GET /admin/api/usage` reports totals per model, **per user**, and **per
+account**, with a dollar figure. The figure is the API-equivalent value — what
+those tokens would have cost on pay-as-you-go pricing. This server runs on a
+subscription, so nothing is billed per token; the number exists to compare one
+user or account against another.
+
+Cache traffic is priced as multiples of the model's input rate: cache read at
+`0.1x`, a 5-minute cache write at `1.25x`. Prices live in
+`src/pricing.js`; neither `/v1/models` nor pi-ai publishes them, so that table is
+the single place to update when a rate changes. A model the table does not know
+contributes no dollar figure and is named in `unpricedModels` rather than being
+silently counted as zero.
+
 ## Accounts
 
 One process can serve more than one Claude subscription. Each **account** is a
