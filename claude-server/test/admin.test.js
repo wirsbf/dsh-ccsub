@@ -774,3 +774,123 @@ test('the probes go through the configured transport, not a side channel', async
     await s.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// The Accounts page.
+//
+// Three facts live in one state column — signed in, signed out, disabled — and
+// collapsing the last two into "signed out" is exactly the bug this guards: an
+// operator looking at a disabled account would go hunting for a sign-in problem
+// that does not exist.
+// ---------------------------------------------------------------------------
+
+/** One account row as the page receives it. */
+function accountRow(overrides = {}) {
+  return {
+    id: 'acct_aaaa1111',
+    name: 'Work',
+    createdAt: 1,
+    lastUsedAt: null,
+    disabled: false,
+    default: false,
+    signedIn: true,
+    expiresAt: Date.now() + 3_600_000,
+    error: null,
+    ...overrides,
+  };
+}
+
+test('the accounts page distinguishes disabled from signed out', () => {
+  const html = renderConsolePage({
+    page: 'accounts',
+    signedIn: true,
+    mode: 'direct',
+    identity: { name: 'admin' },
+    accounts: [
+      accountRow({ id: 'default', name: 'Default account', default: true }),
+      accountRow({ id: 'acct_signedout', name: 'Signed out', signedIn: false, expiresAt: null }),
+      accountRow({ id: 'acct_disabled', name: 'Disabled', disabled: true, signedIn: false, expiresAt: null }),
+    ],
+    users: [],
+  });
+
+  // A disabled account says so, and says what that means for a request.
+  assert.match(html, /pill warn[^>]*>disabled/);
+  assert.match(html, /its tokens are refused/);
+  // A signed-out account is a different state with different advice.
+  assert.match(html, /pill off[^>]*>signed out/);
+  assert.match(html, /sign in to enable/);
+  // And the disabled row is visibly de-emphasised.
+  assert.match(html, /class="row-muted"/);
+});
+
+test('the accounts page renders one row per account with its token count', () => {
+  const html = renderConsolePage({
+    page: 'accounts',
+    signedIn: true,
+    mode: 'direct',
+    identity: { name: 'admin' },
+    accounts: [
+      accountRow({ id: 'default', name: 'Default account', default: true }),
+      accountRow({ id: 'acct_work', name: 'Work' }),
+    ],
+    users: [
+      { id: 'legacy', name: 'Legacy', role: 'admin', accountId: null, legacy: true },
+      { id: 'u_1', name: 'alice', role: 'client', accountId: 'acct_work' },
+      { id: 'u_2', name: 'bob', role: 'client', accountId: 'acct_work' },
+    ],
+  });
+
+  assert.equal((html.match(/data-account-row=/g) ?? []).length, 2);
+  // Two tokens spend the Work account, one spends the default.
+  assert.match(html, /2 tokens/);
+  assert.match(html, /1 token</);
+});
+
+test('the accounts page keeps the default account fixed by GRANT_PATH', () => {
+  const html = renderConsolePage({
+    page: 'accounts',
+    signedIn: true,
+    mode: 'direct',
+    identity: { name: 'admin' },
+    accounts: [accountRow({ id: 'default', name: 'Default account', default: true })],
+    users: [],
+  });
+  // No rename or remove for the default account: it is configuration.
+  assert.match(html, /fixed by GRANT_PATH/);
+  assert.doesNotMatch(html, /data-action="rename"[^>]*data-id="default"/);
+  assert.doesNotMatch(html, /data-action="remove"[^>]*data-id="default"/);
+});
+
+test('the accounts page does not offer sign-in on a disabled account', () => {
+  const html = renderConsolePage({
+    page: 'accounts',
+    signedIn: true,
+    mode: 'direct',
+    identity: { name: 'admin' },
+    accounts: [accountRow({ id: 'acct_off', name: 'Off', disabled: true, signedIn: false })],
+    users: [],
+  });
+  // The button is present but disabled: signing in a disabled account would
+  // succeed and still be refused at relay time, which reads as a bug.
+  assert.match(html, /data-action="signin"[^>]*disabled/);
+});
+
+test('every console page renders without throwing', () => {
+  // A page that throws is a 500 on a credential surface, so every page is
+  // rendered once with a realistic option bag.
+  const options = {
+    signedIn: true,
+    mode: 'direct',
+    identity: { name: 'admin' },
+    cliVersion: '2.1.303',
+    users: [{ id: 'legacy', name: 'Legacy', role: 'admin', accountId: null, legacy: true }],
+    accounts: [accountRow({ id: 'default', default: true })],
+    usage: { totals: { calls: 0 }, byModel: [], recent: [] },
+  };
+  for (const page of ['overview', 'accounts', 'account', 'users', 'usage', 'models']) {
+    const html = renderConsolePage({ page, ...options });
+    assert.ok(html.length > 500, `${page} should render a full page`);
+    assert.match(html, /<html/, `${page} should be a document`);
+  }
+});

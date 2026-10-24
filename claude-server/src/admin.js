@@ -212,7 +212,7 @@ const ICONS = {
 const PAGE_META = {
   overview: {
     title: 'Overview',
-    subtitle: 'The state of the subscription this server holds, at a glance.',
+    subtitle: 'The state of the default subscription, and everything this server has served since it started.',
   },
   accounts: {
     title: 'Accounts',
@@ -220,7 +220,7 @@ const PAGE_META = {
   },
   account: {
     title: 'Account',
-    subtitle: 'Claude sign-in, grant state, and this console session.',
+    subtitle: 'Claude sign-in and grant state for the default account.',
   },
   users: {
     title: 'Users',
@@ -232,7 +232,7 @@ const PAGE_META = {
   },
   models: {
     title: 'Models',
-    subtitle: 'The model catalog this subscription can call.',
+    subtitle: 'The model catalog the default subscription can call.',
   },
 };
 
@@ -430,13 +430,28 @@ function overviewBody(options) {
   const { signedIn, expiresAt, mode, cliVersion, users } = options;
   const enabled = Array.isArray(users) ? users.filter((user) => user.disabled !== true).length : 0;
   const total = Array.isArray(users) ? users.length : 0;
-  return `${pageHead('overview', `<a class="hint" href="${ADMIN_PREFIX}/account">Manage account</a>`)}
+  const accountList = Array.isArray(options.accounts) ? options.accounts : [];
+  const signedInAccounts = accountList.filter(
+    (account) => account.signedIn === true && account.disabled !== true,
+  ).length;
+  return `${pageHead('overview', `<a class="hint" href="${ADMIN_PREFIX}/accounts">Manage accounts</a>`)}
       <div class="tiles">
         ${tile({
-          label: 'Claude sign-in',
+          // This tile describes the default account specifically. Saying so is
+          // the whole point once a server can hold several: an operator looking
+          // at a signed-out tile needs to know *which* subscription it means.
+          label: 'Default account',
           value: signedIn ? 'Signed in' : 'Not signed in',
-          meta: signedIn ? `Access expires ${stamp(expiresAt)}` : 'No grant is stored on this server',
+          meta: signedIn ? `Access expires ${stamp(expiresAt)}` : 'No grant is stored at GRANT_PATH',
           state: signedIn ? 'ok' : 'over',
+        })}
+        ${tile({
+          label: 'Accounts',
+          value: String(accountList.length),
+          meta:
+            accountList.length === 0
+              ? 'Configured from the environment'
+              : `${signedInAccounts} of ${accountList.length} signed in`,
         })}
         ${tile({
           label: 'Quota headroom',
@@ -603,50 +618,87 @@ function usersBody(options) {
  * cannot be renamed or removed because it is configuration, and the page says
  * so rather than offering controls that would be refused.
  */
+/**
+ * The Accounts page: one row per Claude subscription this server serves.
+ *
+ * The state column carries three distinct facts, not one: signed in, signed
+ * out, and disabled. Collapsing the last two into "signed out" hid the reason a
+ * working account stopped answering — an operator looking at a disabled account
+ * would go hunting for a sign-in problem that does not exist.
+ */
 function accountsBody(options) {
   const accounts = Array.isArray(options.accounts) ? options.accounts : [];
+  const users = Array.isArray(options.users) ? options.users : [];
+  /** How many tokens spend this account. */
+  const boundCount = (id) =>
+    users.filter((user) => (user.accountId ?? null) === (id === 'default' ? null : id)).length;
+
   const rows = accounts
     .map((account) => {
       const isDefault = account.default === true;
-      const name = `${esc(account.name)}${isDefault ? ` ${pill('default', 'accent')}` : ''}`;
-      const status =
-        account.signedIn === true
-          ? pill('signed in', 'on')
-          : account.error === null || account.error === undefined
-            ? pill('signed out', 'off')
-            : pill('unreadable', 'off');
-      const expires =
-        typeof account.expiresAt === 'number' ? esc(stamp(account.expiresAt)) : '<span class="hint">—</span>';
+      const disabled = account.disabled === true;
+      const signedIn = account.signedIn === true && !disabled;
+      const unreadable = account.error !== null && account.error !== undefined;
+
+      const name = `<span class="strong">${esc(account.name)}</span>${
+        isDefault ? ` ${pill('default', 'accent')}` : ''
+      }`;
+
+      // Disabled outranks the grant state: it is the reason nothing works.
+      const state = disabled
+        ? pill('disabled', 'warn')
+        : unreadable
+          ? pill('unreadable', 'off')
+          : signedIn
+            ? pill('signed in', 'on')
+            : pill('signed out', 'off');
+      // The second line under the state explains what that state means for a
+      // request, which is the question the operator actually has.
+      const stateNote = disabled
+        ? 'its tokens are refused'
+        : unreadable
+          ? 'guard: grant file unreadable'
+          : signedIn
+            ? 'tokens may relay'
+            : 'sign in to enable';
+      const expires = signedIn
+        ? `<span class="when">${esc(stamp(account.expiresAt))}</span>`
+        : '<span class="dash">—</span>';
+      const bound = boundCount(account.id);
+      const tokens =
+        bound === 0
+          ? '<span class="dash">none</span>'
+          : `<a class="link-quiet" href="/admin/users">${bound} token${bound === 1 ? '' : 's'}</a>`;
+
       const signIn =
-        `<button class="small" type="button" data-action="signin" data-id="${esc(account.id)}" aria-label="Sign in account ${esc(account.name)}">Sign in</button>`;
+        `<button class="small${disabled ? ' ghost' : ''}" type="button" data-action="signin" data-id="${esc(
+          account.id,
+        )}" aria-label="Sign in account ${esc(account.name)}"${disabled ? ' disabled' : ''}>Sign in</button>`;
       // The default account is GRANT_PATH: renaming it would imply a rename that
       // cannot happen, and removing it would strand the deployment's own grant.
       const actions = isDefault
-        ? signIn + '<span class="hint">fixed by GRANT_PATH</span>'
-        : signIn +
-          `<button class="small" type="button" data-action="rename" data-id="${esc(account.id)}" data-name="${esc(
-            account.name,
-          )}" aria-label="Rename account ${esc(account.name)}">Rename</button>` +
+        ? `${signIn}<span class="hint">fixed by GRANT_PATH</span>`
+        : `<button class="small" type="button" data-action="rename" data-id="${esc(
+            account.id,
+          )}" data-name="${esc(account.name)}" aria-label="Rename account ${esc(account.name)}">Rename</button>` +
+          signIn +
           `<button class="small danger" type="button" data-action="remove" data-id="${esc(
             account.id,
           )}" data-name="${esc(account.name)}" aria-label="Remove account ${esc(account.name)}">Remove</button>`;
-      return `<tr data-account-row="${esc(account.id)}">
-          <td class="strong">${name}</td>
-          <td>${status}</td>
+
+      return `<tr data-account-row="${esc(account.id)}"${disabled ? ' class="row-muted"' : ''}>
+          <td>${name}</td>
+          <td><div class="state-cell">${state}<span class="state-note">${esc(stateNote)}</span></div></td>
+          <td>${tokens}</td>
           <td class="when">${expires}</td>
-          <td class="when">${esc(stamp(account.lastUsedAt))}</td>
           <td class="actions">${actions}</td>
         </tr>`;
     })
     .join('\n        ');
 
-  return `${pageHead('accounts')}
-      <div id="signin-slot"></div>
-      ${card(
-        'Add account',
-        `<p class="hint">A new account starts signed out. Sign it in from its row once it is created;
-          each account refreshes and spends its own subscription independently.</p>
-        <form class="form-inline" id="add-account-form" autocomplete="off" style="margin-top:1rem">
+  // The create form is secondary once accounts exist: an operator with a
+  // configured deployment comes here to sign in or rename, not to add another.
+  const createForm = `<form class="form-inline" id="add-account-form" autocomplete="off">
           <div class="field">
             <label for="account-name">Name</label>
             <input id="account-name" name="name" type="text" maxlength="80" placeholder="Work subscription" required>
@@ -655,17 +707,25 @@ function accountsBody(options) {
             <button class="primary" id="add-account" type="submit">Create account</button>
           </div>
         </form>
-        <p class="msg err" id="accounts-error" hidden></p>`,
-      )}
+        <p class="msg err" id="accounts-error" hidden></p>`;
+
+  return `${pageHead('accounts')}
+      <div id="signin-slot"></div>
       <section class="card">
-        <div class="card-head"><h2>Accounts</h2><div class="actions"><span class="hint" id="accounts-count">${accounts.length} total</span></div></div>
+        <div class="card-head">
+          <h2>Accounts</h2>
+          <div class="actions">
+            <span class="hint" id="accounts-count">${accounts.length} total</span>
+            <button class="small" type="button" id="toggle-add-account" aria-expanded="false" aria-controls="add-account-panel">Add account</button>
+          </div>
+        </div>
         <div class="card-body flush">
           ${
             accounts.length === 0
-              ? '<p class="empty" style="padding:1rem">No accounts yet.</p>'
+              ? `<p class="empty" style="padding:var(--s-4)">No accounts yet. The default account appears once <code>GRANT_PATH</code> holds a grant.</p>`
               : `<div class="table-wrap"><table class="data" id="accounts-table">
             <thead><tr>
-              <th>Name</th><th>State</th><th>Token expires</th><th>Last used</th>
+              <th>Name</th><th>State</th><th>Tokens</th><th>Token expires</th>
               <th class="num">Actions</th>
             </tr></thead>
             <tbody>
@@ -674,20 +734,17 @@ function accountsBody(options) {
           </table></div>`
           }
         </div>
+        <div class="card-panel" id="add-account-panel" hidden>
+          <p class="hint panel-intro">A new account starts signed out. Sign it in from its row once it is created;
+            each account refreshes and spends its own subscription independently.</p>
+          ${createForm}
+        </div>
       </section>
-      <p class="note">A token issued to a user is bound to one account and only ever spends that subscription.
-        Removing an account deletes its stored grant; the users pointing at it will be refused until they are
-        moved to another account.</p>`;
+      <p class="note">A token is bound to one account and only ever spends that subscription.
+        A signed-in account answers relayed requests; a signed-out or disabled one refuses them rather than
+        borrowing another account's grant.</p>`;
 }
 
-/**
- * The account `<option>` list for the Create-token form.
- *
- * The default account is the `""` value: the API reads an absent or null
- * account id as "default", so the first option needs no special casing.
- * @param accounts - the account list, when the page loaded one.
- * @returns escaped option markup.
- */
 function accountOptions(accounts) {
   const list = Array.isArray(accounts) ? accounts : [];
   if (list.length === 0) return '<option value="" selected>default</option>';
@@ -1556,6 +1613,22 @@ const CONSOLE_SCRIPT = `
   };
 
   var reloadAccounts = function () { window.location.reload(); };
+
+  // The create form starts folded: with accounts configured, the reason to open
+  // this page is to sign one in or rename it, not to add another.
+  var toggleAddAccount = document.getElementById('toggle-add-account');
+  var addAccountPanel = document.getElementById('add-account-panel');
+  if (toggleAddAccount && addAccountPanel) {
+    toggleAddAccount.addEventListener('click', function () {
+      var open = addAccountPanel.hidden;
+      addAccountPanel.hidden = !open;
+      toggleAddAccount.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) {
+        var nameInput = document.getElementById('account-name');
+        if (nameInput) nameInput.focus();
+      }
+    });
+  }
 
   var addAccountForm = document.getElementById('add-account-form');
   if (addAccountForm) {

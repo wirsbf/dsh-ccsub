@@ -303,9 +303,13 @@ export const ADMIN_STYLE = `
   .card-body + .card-body { border-top: 1px solid var(--border); }
 
   /* ---- stat tiles ------------------------------------------------------ */
+  /* The page has five tiles now (sign-in, accounts, quota, users, calls). A
+     fixed 12rem minimum fits four across a wide window and orphans the fifth on
+     a line of its own, so the track is allowed to shrink: five fit until the
+     window is genuinely narrow, then the grid reflows in even rows. */
   .tiles {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
     gap: var(--s-3);
     margin: 0 0 var(--s-4);
   }
@@ -386,6 +390,7 @@ export const ADMIN_STYLE = `
     color: var(--text-muted);
   }
   .field .field-hint { margin: var(--s-1) 0 0; font-size: var(--fs-caption); color: var(--text-faint); }
+  .field-hint { margin: 0; font-size: var(--fs-caption); color: var(--text-faint); line-height: 1.5; }
   input[type="text"], input[type="password"], input[type="search"], select {
     width: 100%;
     padding: var(--s-2) var(--s-3);
@@ -410,6 +415,11 @@ export const ADMIN_STYLE = `
   .form-inline .field { margin: 0; flex: 1 1 12rem; }
   .form-inline .field.compact { flex: 0 1 13rem; }
   .form-inline .form-submit { flex: none; padding-bottom: 1px; }
+  /* A hint that follows an inline form sits below the whole row of controls, so
+     it needs a real gap: flush against the inputs it reads as clipped text
+     rather than as an explanation of them. */
+  .form-inline + .field-hint { margin: var(--s-3) 0 0; }
+  .field-hint + .field-hint { margin-top: var(--s-2); }
 
   /* ---- buttons --------------------------------------------------------- */
   button {
@@ -541,6 +551,33 @@ export const ADMIN_STYLE = `
   }
   .empty { margin: 0; padding: var(--s-3) 0; color: var(--text-muted); font-size: var(--fs-body); }
   .card-body > .empty:only-child { padding: var(--s-2) 0; }
+  /* ---- account rows ---------------------------------------------------- */
+  /* A disabled row still has to be readable: muting the whole row while keeping
+     the state pill at full strength is how the operator sees "this one is off"
+     without the numbers becoming unreadable. */
+  table.data tbody tr.row-muted td { color: var(--text-faint); }
+  table.data tbody tr.row-muted td .pill { opacity: 1; }
+  /* State cell: the pill and the sentence that explains it stack, so the
+     difference between "signed out" and "disabled" is a reason, not a colour. */
+  .state-cell { display: flex; flex-direction: column; gap: var(--s-1); align-items: flex-start; }
+  .state-note { font-size: var(--fs-caption); color: var(--text-faint); white-space: nowrap; }
+  /* An absent value is a deliberate empty, not a missing cell: a dash reads as
+     "none" where a blank cell reads as a rendering bug. */
+  .dash { color: var(--text-faint); }
+  /* A link inside a table cell that should not look like a call to action. */
+  .link-quiet { color: var(--text-muted); text-decoration: none; border-bottom: 1px dotted var(--border-strong); }
+  .link-quiet:hover { color: var(--text); }
+  /* The add-account panel: a card body that appears below the table when the
+     header button is pressed, so the list stays the page's subject. */
+  .card-panel { padding: var(--s-4); border-top: 1px solid var(--border); background: var(--surface-input); }
+  .card-panel[hidden] { display: none; }
+  /* An explanation sitting above its form needs a gap of its own: .hint has no
+     margin by default, which is right inline but reads as clipped here. */
+  .card-panel .panel-intro { margin: 0 0 var(--s-3); }
+  /* A secondary action that must not compete with the primary one. */
+  button.small.ghost { background: transparent; border-color: transparent; color: var(--text-faint); }
+  button.small.ghost:hover:not(:disabled) { background: var(--surface-raised); color: var(--text-muted); }
+
 
   /* ---- messages -------------------------------------------------------- */
   .msg {

@@ -295,12 +295,14 @@ export function createServer(options) {
           mode: transport.mode,
           cliVersion: config.claudeCliVersion,
           identity,
-          // Only the pages that show a user count pay for the read.
-          users: page === 'users' || page === 'overview' ? await userList() : [],
+          // Only the pages that need the user list pay for the read: Users and
+          // Overview count them, and Accounts shows how many tokens spend each
+          // account.
+          users: page === 'users' || page === 'overview' || page === 'accounts' ? await userList() : [],
           // The Accounts page renders the list; the Users page needs it to
           // resolve each token's account name. Other pages pay nothing.
           accounts:
-            (page === 'accounts' || page === 'users') && accounts !== undefined
+            (page === 'accounts' || page === 'users' || page === 'overview') && accounts !== undefined
               ? await accounts.list().catch(() => [])
               : [],
         }),
