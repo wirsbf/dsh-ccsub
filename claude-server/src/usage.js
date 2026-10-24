@@ -33,6 +33,17 @@ import { costOf } from './pricing.js';
 /** How many recent calls to keep for inspection. */
 const MAX_RECENT = 50;
 
+/**
+ * How many tokens a cache write may exceed the prompt's growth by before it is
+ * treated as a rewrite rather than an extension.
+ *
+ * Anthropic caches at block boundaries, not token boundaries, so a write is
+ * always somewhat larger than the exact growth. This margin is far below one
+ * block, which keeps the classification honest for a real rewrite (thousands of
+ * tokens) while not flagging the normal block granularity.
+ */
+const WASTE_MARGIN = 1024;
+
 /** Default bound on a pending SSE frame, in characters. */
 const DEFAULT_FRAME_LIMIT = 256 * 1024;
 
@@ -238,6 +249,87 @@ export class UsageLedger {
     this.costUsd = 0;
     /** Model ids the price table does not know, so the console can say so. */
     this.unpricedModels = new Set();
+    /**
+     * Per cache-identity state, for the reuse analysis.
+     *
+     * Cache identity is the (tools, system) pair a request caches under. One
+     * entry per identity holds the highest prompt size that identity has ever
+     * had cached, which is the baseline the next call is compared against: a
+     * call whose prompt is not larger than that baseline *should* have read it
+     * all back, so a read below it is a miss that needs explaining.
+     */
+    this.byCacheIdentity = new Map();
+  }
+
+  /**
+   * Classify one call's cache behaviour against its identity's own history.
+   *
+   * The three outcomes are deliberately distinct, because they call for
+   * different fixes:
+   *
+   * - `first` — nothing cached under this identity yet. A write is expected.
+   * - `extended` — the prompt grew past the previous high-water mark. A write of
+   *   the new tail is expected; the part up to the old mark should have been a
+   *   read, so a read near zero here is a real miss.
+   * - `reused` — the prompt did not grow, so the whole thing should have been a
+   *   read. Any write at all here is the costly case: the prefix was already
+   *   cached and was paid for again.
+   *
+   * @param identity - the (tools, system) cache identity, or undefined.
+   * @param promptTokens - this call's total prompt size (input + cache read + cache write).
+   * @param readTokens - of that, how much came from cache.
+   * @param writeTokens - of that, how much was written to cache.
+   * @returns {{verdict: string, identity?: string, previousHigh?: number, reuseRatio?: number}}
+   */
+  classifyCache(identity, promptTokens, readTokens, writeTokens) {
+    if (identity === undefined) return { verdict: 'unknown' };
+    const state = this.byCacheIdentity.get(identity);
+    const previousHigh = state?.highWater ?? 0;
+    // Share of the prompt that came back from cache. Only meaningful once
+    // something was cached, which is why `first` reports none.
+    const reuseRatio = promptTokens > 0 ? readTokens / promptTokens : undefined;
+
+    // How much *new* content this call brought, relative to the largest prefix
+    // this identity has already cached. Everything up to `previousHigh` was
+    // already cacheable and should have been read.
+    const growth = Math.max(0, promptTokens - previousHigh);
+    // A write is expected to cover the growth and little else. Anthropic caches
+    // in blocks, so a write a couple of blocks larger than the growth is normal;
+    // one that dwarfs it means the prefix was rebuilt instead of extended, which
+    // is the expensive case worth naming.
+    const wasted = writeTokens > growth + WASTE_MARGIN;
+
+    let verdict;
+    if (state === undefined) verdict = 'first';
+    else if (promptTokens <= previousHigh) verdict = 'reused';
+    else verdict = wasted ? 'rewritten' : 'extended';
+
+    // What the cache holds after this call: everything read back plus everything
+    // just written. Input tokens are beyond the last breakpoint and are not part
+    // of it, so they are excluded — counting the whole prompt here would make the
+    // bar rise on every call and hide real misses.
+    const cachedAfter = readTokens + writeTokens;
+    // The mark only advances: a shorter prompt can still be a hit on the longer
+    // cached prefix, and letting the bar drift down would turn every later call
+    // into an "extension" and make misses invisible.
+    const nextHigh = Math.max(previousHigh, cachedAfter);
+    const bucket = state ?? {
+      calls: 0,
+      first: 0,
+      extended: 0,
+      reused: 0,
+      rewritten: 0,
+      wastedWrites: 0,
+      highWater: 0,
+    };
+    bucket.calls += 1;
+    bucket[verdict] += 1;
+    // The number that matters: a write that bought little or no new prefix.
+    if ((verdict === 'reused' || verdict === 'rewritten') && writeTokens > 0) bucket.wastedWrites += 1;
+    bucket.highWater = nextHigh;
+    this.byCacheIdentity.set(identity, bucket);
+
+    return { verdict, identity, previousHigh, reuseRatio };
   }
 
   /**
@@ -290,14 +382,33 @@ export class UsageLedger {
     accumulate(accountBucket, entry);
     accountBucket.costUsd += cost ?? 0;
     this.byAccount.set(accountKey, accountBucket);
+
+    // Cache diagnostics. The shape travels with the entry from the relay, which
+    // is the only place the request body exists; see `shape.js` for why these
+    // fields are digests rather than the text.
+    const shape = entry.shape;
+    const identity = entry.cacheIdentity;
+    const inputTokens = entry.input_tokens ?? 0;
+    const readTokens = entry.cache_read_input_tokens ?? 0;
+    const writeTokens = entry.cache_creation_input_tokens ?? 0;
+    const promptTokens = inputTokens + readTokens + writeTokens;
+    const cache = this.classifyCache(identity, promptTokens, readTokens, writeTokens);
+
     this.recent.unshift({
       at: Date.now(),
       model: model ?? null,
-      input_tokens: entry.input_tokens ?? 0,
+      input_tokens: inputTokens,
       output_tokens: entry.output_tokens ?? 0,
-      cache_creation_input_tokens: entry.cache_creation_input_tokens ?? 0,
-      cache_read_input_tokens: entry.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens: writeTokens,
+      cache_read_input_tokens: readTokens,
       durationMs: entry.durationMs ?? null,
+      // The identity a row groups under, and whether this call's cache
+      // behaviour was expected. `first`/`extended` writes are normal; a write
+      // under `reused` is the expensive anomaly.
+      cacheIdentity: identity ?? null,
+      cacheVerdict: cache.verdict,
+      reuseRatio: cache.reuseRatio ?? null,
+      shape: shape ?? null,
     });
     if (this.recent.length > MAX_RECENT) this.recent.length = MAX_RECENT;
   }
@@ -329,6 +440,17 @@ export class UsageLedger {
       costUsd: this.costUsd,
       /** Models the price table could not price; their tokens are not counted. */
       unpricedModels: [...this.unpricedModels],
+      /**
+       * Cache reuse, grouped by the (tools, system) pair its prefix belongs to.
+       *
+       * The point of grouping: a subagent has a restricted tool set and its own
+       * persona, so it caches under a different identity and its misses are not
+       * the main conversation's. Summing them together is what makes a working
+       * cache look broken.
+       */
+      byCacheIdentity: [...this.byCacheIdentity.entries()]
+        .map(([identity, bucket]) => ({ identity, ...bucket }))
+        .sort((a, b) => b.calls - a.calls),
       recent: [...this.recent],
       // Stated wherever the numbers appear: this is process memory, so a
       // restart starts from zero.
@@ -342,6 +464,7 @@ export class UsageLedger {
     this.byModel.clear();
     this.byUser.clear();
     this.byAccount.clear();
+    this.byCacheIdentity.clear();
     this.recent = [];
     this.since = Date.now();
     this.costUsd = 0;

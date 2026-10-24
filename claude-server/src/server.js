@@ -51,6 +51,7 @@ import { ClientAuth } from './auth.js';
 import { THINKING_BETAS, ensureBaseBetas, wantsThinkingBetas, withClaudeIdentity } from './identity.js';
 import { LoginSessions } from './login.js';
 import { SessionBindings, fingerprintOf } from './sessions.js';
+import { cacheIdentityOf, cacheShape } from './shape.js';
 import { exchangeCode, parseAuthorizationInput, refreshGrant } from './oauth.js';
 import { sanitizeBody } from './sanitize.js';
 import { hasJsonBody, upstreamFor } from './upstream.js';
@@ -1405,6 +1406,12 @@ async function relay(req, res, ctx) {
   // at all (`undefined`) is eligible for session routing. Collapsing them would
   // silently move the bootstrap bearer off the default account.
   const fingerprint = fingerprintOf(parsedBody);
+  // What this request caches under, for the usage ledger's cache analysis. The
+  // shape is computed from the body *as received*, before sanitisation, because
+  // the question it answers is "which prefix did this caller send" — and a
+  // digest of the same text on both sides is what makes two turns comparable.
+  const shape = cacheShape(parsedBody);
+  const cacheIdentity = cacheIdentityOf(shape);
   let serving = accountId;
   let switchedFrom;
 
@@ -1622,6 +1629,11 @@ async function relay(req, res, ctx) {
         // The account that *served* the call, not the token's declared binding:
         // an `auto` token is attributed to the subscription it actually spent.
         accountId: typeof serving === 'string' ? serving : null,
+        // The cache prefix this request belonged to, and the shape that produced
+        // it. Carried here because this is the only scope where the request body
+        // still exists; the ledger only aggregates.
+        cacheIdentity,
+        shape,
       });
     }
   }

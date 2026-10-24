@@ -369,7 +369,6 @@ export function renderLockPage(options = {}) {
 </head>
 <body>
 <div class="lock-shell">
-  <main class="lock">
     ${brandMarkup(undefined)}
     <h1>Unlock the console</h1>
     <p class="lede">Paste an admin token. It is verified once and exchanged for an
@@ -847,7 +846,7 @@ export function renderConsolePage(options = {}) {
  * No template literals, no arrow functions required, no DOM building with
  * `innerHTML` from API data — every value goes through `textContent`.
  */
-const CONSOLE_SCRIPT = `
+export const CONSOLE_SCRIPT = `
 (function () {
   'use strict';
 
@@ -912,7 +911,7 @@ const CONSOLE_SCRIPT = `
   };
 
   /**
-   * A dollar figure. Small values keep four decimals so a cheap model's traffic
+   * A dollar figure. Small values keep four decimals so a cheap model traffic
    * does not render as a column of $0.00.
    */
   var usd = function (value) {
@@ -922,6 +921,73 @@ const CONSOLE_SCRIPT = `
 
   var num = function (n) {
     return typeof n === 'number' ? n.toLocaleString() : '0';
+  };
+
+  /**
+   * A cache-identity id, shortened for a table cell.
+   *
+   * The id is a tools hash and a system hash joined by a colon, so the two
+   * halves are shown as a pair
+   * rather than truncated to one blob: a reader comparing two rows wants to see
+   * *which* half changed.
+   */
+  var shortIdentity = function (identity) {
+    var parts = String(identity).split(':');
+    return parts.map(function (part) { return part.slice(0, 6); }).join(':');
+  };
+
+  /**
+   * A monospaced span carrying an identity and an explanatory tooltip.
+   *
+   * Deliberately local rather than reusing the Users page badge helper: that
+   * one lives inside renderUsers, and calling across that boundary is what
+   * turned a missing binding into a blank page once already.
+   */
+  var identityCell = function (text, title) {
+    var span = document.createElement('span');
+    span.textContent = text;
+    span.title = title;
+    span.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+    span.style.fontSize = '0.85em';
+    return span;
+  };
+
+  /**
+   * A tooltip explaining what an identity is made of.
+   *
+   * Without the sizes the ids are opaque, and "why did this prefix change" is
+   * the actual question an operator has.
+   */
+  var identityTitle = function (shape) {
+    if (!shape) return 'no request shape recorded';
+    return 'tools: ' + (shape.toolsCount || 0) + ' declared, ' + (shape.toolsHash || 'none') +
+      ' | system: ' + (shape.systemBytes || 0) + ' bytes, ' + (shape.systemHash || 'none') +
+      ' | messages: ' + (shape.messagesCount || 0);
+  };
+
+  /**
+   * Render a cache verdict as a word plus its meaning in the tooltip.
+   *
+   * The reused-with-write case is the only outcome that means a cached prefix
+   * was paid for again; the rest are normal and are labelled so they are not
+   * mistaken for failures.
+   */
+  var verdictLabel = function (verdict) {
+    var span = document.createElement('span');
+    var kinds = {
+      first: ['first', 'Nothing cached under this prefix yet, so this write is expected.'],
+      extended: ['grew', 'The prompt grew past this prefix high-water mark, so writing the new tail is expected. The part up to the old mark should still have been a read.'],
+      reused: ['reused', 'The prompt did not grow, so the whole prefix should have come from cache. A cache write here is the expensive case: it was already paid for.'],
+      rewritten: ['rewritten', 'The prompt grew only slightly but the cache write covers the whole prefix instead of just the new tail. The prefix was rebuilt rather than extended, which costs what never having cached would have.'],
+      unknown: ['—', 'No cache identity was recorded for this request.']
+    };
+    var kind = kinds[verdict] || kinds.unknown;
+    span.textContent = kind[0];
+    span.title = kind[1];
+    // Only the two outcomes that mean "a cached prefix was paid for again" get
+    // the warning treatment; the rest are ordinary and must not look alarming.
+    if (verdict === 'reused' || verdict === 'rewritten') span.className = 'ok';
+    return span;
   };
 
   var table = function (headers, rows, numericFrom) {
@@ -941,7 +1007,15 @@ const CONSOLE_SCRIPT = `
       var tr = document.createElement('tr');
       row.forEach(function (value, index) {
         var td = document.createElement('td');
-        td.textContent = value;
+        // A cell may carry an element when it needs a tooltip or a badge. Every
+        // other caller passes text or numbers, and textContent would render
+        // an element as "[object HTMLSpanElement]", so the two cases are told
+        // apart here rather than at each call site.
+        if (value !== null && typeof value === 'object' && typeof value.nodeType === 'number') {
+          td.append(value);
+        } else {
+          td.textContent = value;
+        }
         if (index >= numericFrom) td.className = 'num';
         else if (index === 0) td.className = 'strong';
         tr.append(td);
@@ -1108,12 +1182,18 @@ const CONSOLE_SCRIPT = `
         // that reads 200k from cache and one that writes 200k cost an order of
         // magnitude apart, and that distinction is invisible from input/output
         // alone.
+        //
+        // The identity and verdict columns are what make a low hit rate
+        // diagnosable rather than merely visible. Without them a subagent
+        // brand-new cache and a broken main conversation look identical,
+        // because both show a large write next to a small read.
         wrap.append(table(
-          ['Time', 'Model', 'Input', 'Output', 'Cache read', 'Cache write', 'Hit', 'Duration'],
-          data.recent.slice(0, 8).map(function (call) {
+          ['Time', 'Model', 'Input', 'Output', 'Cache read', 'Cache write', 'Hit', 'Prefix', 'Expected', 'Duration'],
+          data.recent.slice(0, 12).map(function (call) {
             var read = call.cache_read_input_tokens || 0;
             var write = call.cache_creation_input_tokens || 0;
             var billed = (call.input_tokens || 0) + read + write;
+            var verdict = call.cacheVerdict || 'unknown';
             return [
               new Date(call.at).toLocaleTimeString(),
               call.model || '(unknown)',
@@ -1125,12 +1205,24 @@ const CONSOLE_SCRIPT = `
               // watch: a conversation that stays on one account trends upward,
               // one that hops accounts restarts near zero every turn.
               billed > 0 ? Math.round((100 * read) / billed) + '%' : '—',
+              // Which cache prefix this request used. Two rows with different
+              // ids were never going to share a cache, so comparing their hit
+              // rates is meaningless.
+              call.cacheIdentity
+                ? identityCell(shortIdentity(call.cacheIdentity), identityTitle(call.shape))
+                : '—',
+              verdictLabel(verdict),
               call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's'
             ];
           }),
           1
         ));
         recentBody.append(wrap);
+        var note = document.createElement('p');
+        note.className = 'empty';
+        note.textContent = 'first and grew are expected: nothing was cached yet, or the prompt got longer. ' +
+          'Watch rewritten and reused: both mean a prefix that was already cached was paid for again.';
+        recentBody.append(note);
       }
     }
     if (tileCalls && data && data.totals) {
@@ -1194,29 +1286,38 @@ const CONSOLE_SCRIPT = `
           tokensBody.append(h, wrap);
         }
 
-        var recent = data.recent || [];
-        if (recent.length > 0) {
-          var rh = document.createElement('h3');
-          rh.className = 'subhead';
-          rh.style.margin = '1.25rem 0 0.5rem';
-          rh.textContent = 'Recent calls';
-          var rwrap = document.createElement('div');
-          rwrap.className = 'table-wrap';
-          rwrap.append(table(
-            ['Time', 'Model', 'Input', 'Output', 'Duration'],
-            recent.slice(0, 10).map(function (call) {
+        var identities = data.byCacheIdentity || [];
+        if (identities.length > 0) {
+          var ih = document.createElement('h3');
+          ih.className = 'subhead';
+          ih.style.margin = '1.25rem 0 0.5rem';
+          ih.textContent = 'Cache reuse by prefix';
+          var idNote = document.createElement('p');
+          idNote.className = 'empty';
+          idNote.textContent = 'Each row is one cacheable prefix, identified by its tool set and system prompt. ' +
+            'A subagent has a restricted tool set and its own persona, so it caches as its own row and its ' +
+            'first write is not the main conversation missing. "Writes after reuse" counts the calls that ' +
+            'paid to cache a prefix that had not grown: those are the only genuine misses.';
+          var iwrap = document.createElement('div');
+          iwrap.className = 'table-wrap';
+          iwrap.append(table(
+            ['Prefix', 'Calls', 'First', 'Grew', 'Reused', 'Writes after reuse', 'High-water tokens'],
+            identities.map(function (row) {
               return [
-                new Date(call.at).toLocaleTimeString(),
-                call.model || '(unknown)',
-                num(call.input_tokens),
-                num(call.output_tokens),
-                call.durationMs === null ? '—' : (call.durationMs / 1000).toFixed(1) + 's'
+                shortIdentity(row.identity),
+                num(row.calls),
+                num(row.first),
+                num(row.extended),
+                num(row.reused),
+                num(row.writesAfterReuse),
+                num(row.highWater)
               ];
             }),
-            2
+            1
           ));
-          tokensBody.append(rh, rwrap);
+          tokensBody.append(ih, idNote, iwrap);
         }
+
       }
     }
     if (tokensSince && data) tokensSince.textContent = 'since ' + new Date(data.since).toLocaleString();
@@ -1316,7 +1417,7 @@ const CONSOLE_SCRIPT = `
       });
       var cost = document.createElement('td');
       cost.className = 'num strong';
-      // Four decimals keeps a cheap model's traffic visible instead of
+      // Four decimals keeps a cheap model traffic visible instead of
       // rendering every small row as $0.00.
       cost.textContent = typeof row.costUsd === 'number'
         ? (row.costUsd < 1 ? '$' + row.costUsd.toFixed(4) : '$' + row.costUsd.toFixed(2))
@@ -1875,7 +1976,7 @@ const CONSOLE_SCRIPT = `
   }
 
   /**
-   * Show the authorize URL for one account's sign-in attempt.
+   * Show the authorize URL for the sign-in attempt of one account.
    * The attempt id is held in the closure rather than a hidden field so a
    * reload cannot submit a stale one.
    */
