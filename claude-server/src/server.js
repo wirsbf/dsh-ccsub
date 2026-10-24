@@ -529,6 +529,43 @@ export function createServer(options) {
       return;
     }
 
+    // --- accounts (bearer) -----------------------------------------------------
+    // The same account list the console shows, reachable with the operator
+    // bearer rather than a console cookie. A remote plugin needs this to offer a
+    // subscription picker, and it holds a bearer, not a browser session — asking
+    // it to sign into the console would mean a second credential to keep alive.
+    if (pathname === `${ADMIN_PREFIX}/api/accounts` && req.method === 'GET') {
+      const who = await auth.checkAdmin(req.headers.authorization);
+      if (who === undefined) {
+        sendJson(res, 401, { error: 'this endpoint needs the operator bearer', code: 'UNAUTHORIZED' });
+        return;
+      }
+      if (accounts === undefined) {
+        sendJson(res, 200, {
+          ok: true,
+          accounts: [
+            {
+              id: DEFAULT_ACCOUNT_ID,
+              name: 'Default account',
+              signedIn: (await grantState(null)).signedIn === true,
+              disabled: false,
+              quotaLimit: null,
+              default: true,
+            },
+          ],
+        });
+        return;
+      }
+      await api(async () => {
+        try {
+          sendJson(res, 200, { ok: true, accounts: await accounts.list() });
+        } catch (error) {
+          sendJson(res, 500, { error: error.message, code: error.code ?? 'ACCOUNTS_FAILED' });
+        }
+      })();
+      return;
+    }
+
     // Everything below mutates or reveals credential state.
     if (!signedIn) {
       sendJson(res, 401, { error: 'the console session is missing or expired; unlock again' });
