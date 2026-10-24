@@ -1,0 +1,20 @@
+# Build context for the server image.
+#
+# The Dockerfile copies `package.json` and `src/` by name, so nothing here would
+# reach the image. This file is about what reaches the *daemon*: every byte
+# listed below is otherwise packed and uploaded before the first instruction
+# runs, and with a remote build driver that copy leaves the machine.
+#
+# `.env*` is the one that matters. Those files hold the admin bearer and the
+# grant-adjacent settings, and `.gitignore` already keeps them out of the repo —
+# this keeps them out of the build context too, so a stray `docker build` in a
+# checkout cannot ship them to a builder.
+
+node_modules/
+test/
+.env
+.env.*
+!.env.*.example
+*.tgz
+*.log
+.DS_Store

@@ -8,7 +8,14 @@
 #   .env.server    mode=direct  — runs on a server whose own address is the
 #                                 fixed egress IP worth presenting
 #
-# Start with:  docker compose --env-file .env.local up -d --build
+# Start with either shape:
+#
+#   docker compose --env-file .env.local up -d --build    build from this tree
+#   docker compose --env-file .env.local up -d            pull the published image
+#
+# `--build` is the difference, not a second file. Both resolve to the same
+# service; the published image is what the release workflow pushes, so leaving
+# `--build` off tracks the released server instead of one local edit.
 #
 # The port is published to loopback only. Reaching it from another machine is a
 # deliberate tunnel decision (SSH forward or WireGuard), never a bare mapping,
@@ -18,7 +25,16 @@
 services:
   claude-server:
     build: .
-    image: claude-server:0.1.0
+    # `CCSUB_IMAGE` selects the published tag, which is how a deployment follows
+    # releases without cloning:
+    #
+    #   CCSUB_IMAGE=ghcr.io/wirsbf/dsh-ccsub-claude-server:0.3.1 \
+    #     docker compose --env-file .env.server up -d
+    #
+    # The default is a local name rather than the registry path, so a plain
+    # `--build` keeps working with no environment at all and never collides with
+    # a pulled tag.
+    image: ${CCSUB_IMAGE:-dsh-ccsub-claude-server:local}
     container_name: claude-server
     restart: unless-stopped
 

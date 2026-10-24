@@ -1,0 +1,389 @@
+name: release
+
+# One push to `main` releases everything: the DSH plugin tarball and the
+# claude-server container image, under one version number.
+#
+#   test    both suites, plus a Dockerfile build that never leaves the runner
+#   version decide the version and, when it is an automatic patch, commit the
+#           bump back to `main` behind `[skip ci]` so that commit cannot start
+#           another release
+#   plugin  `npm pack` → GitHub Release with the tarball and its SHA256
+#   image   ghcr.io/<owner>/dsh-ccsub-claude-server, tagged with the version
+#
+# The version rule lives in scripts/release-version.mjs, not here: patch is
+# automatic, minor and major are the writer's, signalled by pushing a
+# `package.json` that is already ahead of the newest tag.
+#
+# A release is re-runnable. The `version` job's contract is only "a tag
+# v<version> exists whose tree carries that version"; a tag that is already
+# there is adopted rather than refused, so a failure in `plugin` or `image` is
+# fixed by re-running, not by hand-editing tags.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version to publish instead of deciding one. Leave empty to release the
+          usual way. Set it only to rebuild a release whose tag exists but whose
+          artifacts are missing — the tag must already point at a commit whose
+          package.json carries this version.
+        required: false
+        type: string
+
+# Serialise releases: a second push must not read the tag list while the first
+# is between "decided the version" and "pushed the tag", which would make both
+# runs claim the same number. Never cancel in progress: a half-pushed release
+# leaves the tag list and the manifests disagreeing.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/dsh-ccsub-claude-server
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Both manifests are installed: the plugin resolves its peers from the
+      # root, and the server owns `undici`. There is no lockfile at either level,
+      # so this resolves ranges rather than reproducing a lock — which is what a
+      # user installing the tarball experiences too.
+      - name: Install dependencies
+        run: |
+          npm install --no-package-lock --no-audit --no-fund
+          npm install --prefix claude-server --no-package-lock --no-audit --no-fund
+
+      # Each manifest has its own `test` script scoped to its own files. Running
+      # the root one would not cover the server, and a bare `node --test` at the
+      # root would collect both suites while only the root has the plugin's peer
+      # dependencies — which is exactly the failure a fresh clone hits.
+      - name: Test the plugin
+        run: npm test
+
+      - name: Test the server
+        run: npm test --prefix claude-server
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      # Proof that the Dockerfile still builds, before any registry is touched.
+      # `push: false` with no login means a broken build fails here rather than
+      # halfway through publishing.
+      - name: Build the image without pushing
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: ./claude-server
+          push: false
+          cache-from: type=gha,scope=claude-server
+          cache-to: type=gha,mode=max,scope=claude-server
+
+  version:
+    name: decide version
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      kind: ${{ steps.decide.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # Every tag must be visible: the decision is "manifest versus newest
+          # tag", and a shallow clone silently reports "no tags", which would
+          # release the manifest version again and again.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Decide
+        id: decide
+        run: |
+          set -euo pipefail
+          tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo '')
+          echo "newest tag in history: ${tag:-<none>}"
+
+          # A re-run must complete the release its first attempt started, not
+          # start another one. The first attempt stamps its run id into the
+          # release commit, so a tag carrying this run's id is that attempt's
+          # tag — and it is the version to republish.
+          reuse=$(node scripts/reuse-tag.mjs "$RUN_ID")
+          echo "tag from an earlier attempt of this run: ${reuse:-<none>}"
+
+          extra=()
+          [ -n "$reuse" ] && extra+=(--reuse-tag "$reuse")
+          [ -n "$FORCED_VERSION" ] && extra+=(--version "$FORCED_VERSION")
+          node scripts/release-version.mjs --latest-tag "$tag" ${extra[@]+"${extra[@]}"} > decided.json
+          cat decided.json
+
+          {
+            echo "version=$(node -p "require('./decided.json').version")"
+            echo "kind=$(node -p "require('./decided.json').kind")"
+            echo "reuse=$(node -p "require('./decided.json').reuse")"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          RUN_ID: ${{ github.run_id }}
+          FORCED_VERSION: ${{ inputs.version }}
+
+      # Only a run that decided a new version can need to write one.
+      # Writes the decided version into both manifests. Passing it explicitly
+      # rather than letting the script decide again is deliberate: `git
+      # describe` can move between steps if a concurrent run tags, and the
+      # version under release must be the one `Decide` printed.
+      - name: Apply
+        if: steps.decide.outputs.reuse != 'true'
+        run: |
+          set -euo pipefail
+          node scripts/release-version.mjs --apply --version "$VERSION"
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+
+      # The release commit carries `[skip ci]` — GitHub honours it by not
+      # starting another run — and `Release-Run:` which is how a re-run of this
+      # same run recognises the tag it already pushed. They are separate lines
+      # because `[skip ci]` must be in the subject to work at all.
+      #
+      # The tag is created before the push so `--atomic` publishes commit and
+      # tag together: a partial push cannot leave a tag pointing at a tree that
+      # never got the bump.
+      - name: Commit the bump and tag it
+        id: commit
+        if: steps.decide.outputs.reuse != 'true'
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          if git diff --quiet -- package.json claude-server/package.json; then
+            echo "manifests already at $version; tagging the current commit"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json claude-server/package.json
+          git commit \
+            -m "Release $version [skip ci]" \
+            -m "Automatic patch bump from the release workflow. The minor and major digits are the writer's: edit the root package.json version above the newest tag and push, and that version is released as-is." \
+            -m "Release-Run: $RUN_ID"
+          git tag -a "v$version" -m "Release $version" -m "Release-Run: $RUN_ID"
+          git push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/v$version"
+          echo "bump=true" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+          RUN_ID: ${{ github.run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+
+      # An unchanged manifest — a manual bump, or the first release — leaves
+      # nothing to commit, so the tag is created here instead. The marker goes
+      # into the annotation for the same reason as above.
+      - name: Tag an unchanged manifest
+        if: steps.decide.outputs.reuse != 'true' && steps.commit.outputs.bump == 'false'
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "tag v$version already exists; nothing to do"
+            exit 0
+          fi
+          git tag -a "v$version" -m "Release $version" -m "Release-Run: $RUN_ID"
+          git push origin "refs/tags/v$version"
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+          RUN_ID: ${{ github.run_id }}
+
+  plugin:
+    name: release plugin
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Built from the tag, not from the branch: the published bytes then
+      # correspond to a tree anyone can check out.
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          version='${{ needs.version.outputs.version }}'
+          npm pack
+          file="dsh-ccsub-$version.tgz"
+          test -f "$file"
+
+          # pnpm resolves a tarball's single top-level `package/` prefix. Without
+          # it the archive unpacks flat and every `exports` path 404s, so this is
+          # checked rather than assumed.
+          top=$(tar tzf "$file" | head -1)
+          case "$top" in
+            package/*) ;;
+            *) echo "tarball is missing its package/ prefix (first entry: $top)" >&2; exit 1 ;;
+          esac
+
+          # The packed manifest must name the released version.
+          packed=$(tar xzOf "$file" package/package.json \
+            | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          test "$packed" = "$version" || { echo "packed version $packed != $version" >&2; exit 1; }
+
+          # Every entry `files` promises has to be inside it.
+          for path in lib/index.js lib/client/index.js cordis.patch.yml icon.svg; do
+            tar tzf "$file" | grep -qx "package/$path" || { echo "missing from tarball: $path" >&2; exit 1; }
+          done
+
+          sha256sum "$file" > "$file.sha256"
+          cat "$file.sha256"
+
+          # A second copy under a name with no version in it. GitHub's
+          # `releases/latest/download/<asset>` redirect then gives an install
+          # command that keeps working across releases:
+          #
+          #   dsh plugin --profile web add <repo>/releases/latest/download/dsh-ccsub.tgz
+          #
+          # The versioned asset stays the canonical one; the checksum covers
+          # both because both are byte-identical.
+          cp "$file" dsh-ccsub.tgz
+          cp "$file.sha256" dsh-ccsub.tgz.sha256
+          sed -i "s/  .*\\.tgz\$/  dsh-ccsub.tgz/" dsh-ccsub.tgz.sha256
+          cat dsh-ccsub.tgz.sha256
+          cmp "$file" dsh-ccsub.tgz
+
+          {
+            echo "file=$file"
+            echo "sha256=$(cut -d' ' -f1 "$file.sha256")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          FILE: ${{ steps.pack.outputs.file }}
+          SHA256: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<NOTES
+          DSH plugin tarball, and the matching claude-server image.
+
+          ### Install the plugin
+
+          \`\`\`bash
+          dsh plugin --profile web add https://github.com/${{ github.repository }}/releases/latest/download/dsh-ccsub.tgz
+          \`\`\`
+
+          That URL has no version in it and is repointed by every release, so it
+          also upgrades. To pin this version instead:
+
+          \`\`\`bash
+          dsh plugin --profile web add https://github.com/${{ github.repository }}/releases/download/v$VERSION/$FILE
+          \`\`\`
+
+          Or through the agent tool: \`plugin_manager\` → \`install_bundle\`, target = either URL.
+
+          ### Run the server
+
+          \`\`\`bash
+          docker pull $IMAGE_NAME:$VERSION
+          \`\`\`
+
+          ### Verify
+
+          \`\`\`
+          $SHA256  $FILE
+          \`\`\`
+          NOTES
+
+          # Re-running must complete a release that already has its tag, so an
+          # existing release is updated rather than treated as an error.
+          assets=("$FILE" "$FILE.sha256" dsh-ccsub.tgz dsh-ccsub.tgz.sha256)
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" "${assets[@]}" --clobber
+            gh release edit "v$VERSION" --notes-file notes.md --latest --title "dsh-ccsub $VERSION"
+          else
+            gh release create "v$VERSION" "${assets[@]}" \
+              --title "dsh-ccsub $VERSION" \
+              --notes-file notes.md \
+              --latest
+          fi
+
+  image:
+    name: release image
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: v${{ needs.version.outputs.version }}
+
+      - uses: docker/setup-qemu-action@v4.4.0
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `flavor: latest=false` stops metadata-action adding `latest` itself, so
+      # the tag list is exactly what is written below. The commit tag is the
+      # provenance: a version tag can be re-pointed, a sha tag names one tree.
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      # arm64 as well as amd64: the image is a plain Node process with one
+      # runtime dependency and no native builds, so the emulated build costs
+      # little and covers ARM hosts and Apple silicon without a second pipeline.
+      - name: Build and push
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: ./claude-server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=claude-server
+          cache-to: type=gha,mode=max,scope=claude-server
+
+      - name: Summary
+        run: |
+          {
+            echo "### claude-server ${{ needs.version.outputs.version }}"
+            echo
+            echo '```'
+            echo "docker pull ${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}"
+            echo '```'
+            echo
+            echo 'Platforms: `linux/amd64`, `linux/arm64`'
+          } >> "$GITHUB_STEP_SUMMARY"

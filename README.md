@@ -179,14 +179,50 @@ into every settings export.
 
 ## Install
 
+### One command (recommended)
+
+Every push to `main` publishes a release. No clone, no local packing:
+
+```bash
+dsh plugin --profile web add \
+  https://github.com/wirsbf/dsh-ccsub/releases/latest/download/dsh-ccsub.tgz
+```
+
+That URL carries no version and is repointed by each release, so the same
+command also upgrades. Through the agent tool, `target` takes the URL directly:
+
+```
+plugin_manager → install_bundle
+  target = https://github.com/wirsbf/dsh-ccsub/releases/latest/download/dsh-ccsub.tgz
+```
+
+To pin a version, take the versioned filename from the release page:
+
+```bash
+dsh plugin --profile web add \
+  https://github.com/wirsbf/dsh-ccsub/releases/download/v0.2.3/dsh-ccsub-0.2.3.tgz
+```
+
+Each release ships a `.sha256`; after downloading,
+`sha256sum -c dsh-ccsub.tgz.sha256` verifies it.
+
+### The server image
+
+```bash
+docker pull ghcr.io/wirsbf/dsh-ccsub-claude-server:latest
+```
+
+Both `linux/amd64` and `linux/arm64` are published; pin a version by tag. See
+[`claude-server/`](claude-server/) for deployment.
+
 ### From another machine (the common case)
 
 If a `claude-server` deployment already owns the subscription, a second machine
 needs only this plugin and two values — **no proxy, no subscription token**:
 
 ```bash
-# 1. Get the package onto that machine (this repo is not published to npm).
-#    Either copy the directory, clone it, or install a tarball built below.
+# 1. Get the package onto that machine. The one-command install above is enough
+#    for normal use; clone only when developing.
 git clone https://github.com/wirsbf/dsh-ccsub.git ~/DEV/dsh-ccsub
 
 # 2. Install it into that machine's profile.
@@ -285,11 +321,51 @@ An indeterminate report is logged as indeterminate rather than as success, and
 the card renders drift as an error line and an unknown result as a hint, so a
 mismatch surfaces before the model request it would break.
 
-## Packaging a release
+## Releases and CI/CD
 
-`npm pack` is the whole release build: it honours `package.json`'s `files` list,
-always adds `README*` and `package.json`, and writes the `package/` prefix pnpm
-needs. No build step, no bundler — `lib/` ships as authored.
+A push to `main` releases everything; there is no local packing step and no tag
+to push by hand. GitHub Actions runs four jobs:
+
+| Stage | What it does |
+|---|---|
+| test | both suites (69 plugin + 170 server), plus a Docker build that is never pushed |
+| version | decides the version; on an automatic patch, commits the bump back to `main` behind `[skip ci]` and tags it |
+| plugin | `npm pack` → GitHub Release with the tarball, its SHA256, and a versionless alias |
+| image | builds `linux/amd64` + `linux/arm64` and pushes to GHCR |
+
+### The version rule
+
+**The patch digit advances on its own; minor and major are the writer's.**
+Implemented in [`scripts/release-version.mjs`](scripts/release-version.mjs):
+
+| Root `package.json` version | Result |
+|---|---|
+| equal to the newest tag | patch bump (`0.2.3` → `0.2.4`) |
+| higher than the newest tag | released as written (`0.3.0` ships `0.3.0`) |
+| lower than the newest tag | advances from the tag and warns |
+
+So raising the minor is just: edit the **root** `package.json` version above the
+newest tag and push. `claude-server/package.json` is not a second source of
+truth — the workflow writes it — so do not edit that one to move the release.
+
+### Re-running
+
+- A run that failed in `plugin` or `image`: **Re-run all jobs**. The workflow
+  stamps `Release-Run: <id>` into the release commit/tag, and a re-run reads
+  that marker to recognise the release it already started — it completes the
+  artifacts instead of publishing a second release.
+- A tag exists but its artifacts are missing: run `workflow_dispatch` with
+  `version` set, to republish that version explicitly.
+
+`concurrency: release` deliberately does not cancel in progress: a half-pushed
+release leaves the tag list and the manifests disagreeing, which is worse than
+waiting.
+
+### Packing locally (debugging only)
+
+`npm pack` is still the whole release build: it honours `package.json`'s `files`
+list, always adds `README*` and `package.json`, and writes the `package/` prefix
+pnpm needs. No build step, no bundler — `lib/` ships as authored.
 
 This repository declares no `LICENSE`, so the packed tarball carries none. Add
 one before distributing builds outside your own machine.
@@ -300,23 +376,18 @@ sha256sum dsh-ccsub-<version>.tgz > SHA256SUMS
 ```
 
 `private: true` blocks `npm publish` but does **not** block `npm pack`, so a
-release tarball works with the flag left in place. Keep it there: it is what
-stops an accidental publish of a package whose whole point is local use.
+release tarball works with the flag left in place. Keep it there: releases go
+through GitHub Releases, not npm, and the flag is what stops an accidental
+publish of a package whose whole point is local use.
 
-Install that tarball on any machine:
-
-```bash
-# via the agent tool:  plugin_manager → install_bundle, spec = /abs/path/<file>.tgz
-dsh plugin --profile web add /abs/path/dsh-ccsub-<version>.tgz
-```
+> Verify before handing it out: `tar tzf <file>.tgz | head` must show a single
+> top-level `package/` directory. A tarball without it makes pnpm flatten the
+> files into the install root and every `exports` path then 404. The workflow's
+> `Pack` step asserts this rather than trusting it to be remembered.
 
 The install lands in the profile's store as an immutable artifact (a pnpm
 symlink into `.pnpm/`, not a link back to this source tree), so later edits here
 do not leak into an installed release.
-
-> Verify before handing it out: `tar tzf <file>.tgz | head` must show a single
-> top-level `package/` directory. A tarball without it makes pnpm flatten the
-> files into the install root and every `exports` path then 404.
 
 A healthy install prints `Packages: +1` and exits 0. If it instead reports
 `[ERR_PNPM_IGNORED_BUILDS]` and a few dozen packages, you are installing a build

@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "undici": "^8.10.0"

@@ -156,24 +156,34 @@ bearer 通过 harness 的凭据面存储为 `api-key` 记录，**不写在这份
 
 ## 安装
 
-### 在另一台机器上安装（最常见的用法）
+### 一条命令（推荐）
 
-如果已经有一个 `claude-server` 部署持有订阅，第二台机器只需要装本插件并填**两个值**
-——**不需要代理，也不需要在本地持有订阅 token**：
+每次推送到 `main` 都会自动发布。不需要 clone，也不需要本地打包：
 
 ```bash
-# 1. 把包放到那台机器上（本仓库没有发布到 npm）。
-#    复制目录、clone，或者用下面打包好的 tarball 都行。
-git clone https://github.com/wirsbf/dsh-ccsub.git ~/DEV/dsh-ccsub
-
-# 2. 装进那台机器的 profile。
-#    优先用 agent 工具（它负责 package.json 和 bundle 列表）：
-#      plugin_manager → install_bundle，target = /home/<user>/DEV/dsh-ccsub
-#    或者用 CLI，它会转给 profile 目录里的 pnpm：
-dsh plugin --profile web add /home/<user>/DEV/dsh-ccsub
+dsh plugin --profile web add \
+  https://github.com/wirsbf/dsh-ccsub/releases/latest/download/dsh-ccsub.tgz
 ```
 
-重启 host，然后在**设置 → Claude Subscription** 里只填两个字段：
+这个 URL 里没有版本号，每次发布都会重新指向最新版，所以同一条命令也能用来升级。
+用 agent 工具时 `target` 直接填这个 URL：
+
+```
+plugin_manager → install_bundle
+  target = https://github.com/wirsbf/dsh-ccsub/releases/latest/download/dsh-ccsub.tgz
+```
+
+要锁定版本就从 release 页取带版本号的文件名：
+
+```bash
+dsh plugin --profile web add \
+  https://github.com/wirsbf/dsh-ccsub/releases/download/v0.2.3/dsh-ccsub-0.2.3.tgz
+```
+
+每个 release 都带 `.sha256`，下载后可核对：`sha256sum -c dsh-ccsub.tgz.sha256`。
+
+重启 host，然后在**设置 → Claude Subscription** 里只填三个字段（`claude-server` 模式
+不需要代理，也不需要在本地持有订阅 token）：
 
 | 字段 | 值 |
 |---|---|
@@ -201,6 +211,15 @@ dsh plugin --profile web add /home/<user>/DEV/dsh-ccsub
 
 `claude-server` 模式下 `proxy` 块按设计不生效——Anthropic 看到的出口 IP 是服务器的，
 本地再套一层代理不会改变任何可观测结果，只会多一个失败点。
+
+### 服务端镜像
+
+```bash
+docker pull ghcr.io/wirsbf/dsh-ccsub-claude-server:latest
+```
+
+同时提供 `linux/amd64` 与 `linux/arm64`；固定版本就换成具体 tag。部署见
+[`claude-server/`](claude-server/)。
 
 ### 从源码目录安装
 
@@ -231,11 +250,47 @@ target 指向这个目录）。管理器负责 profile 的 `package.json` 和 bu
 `dependencyReport()` 兜住：它通过运行时解析器取出**实际被加载**的那一份，不满足
 `dsh-llm-pi-ai` 要求时在 `/status` 上报 `compatible: false`。
 
-## 打包发布
+## 发布与 CI/CD
 
-`npm pack` 就是完整的发布构建：它按 `package.json` 的 `files` 挑文件，自动补上
-`README*`、`LICENSE` 和 `package.json`，并生成 pnpm 需要的 `package/` 前缀。没有
-构建步骤、没有打包器——`lib/` 按源码原样发布。
+推送到 `main` 就会自动发布，不需要本地打包，也不需要打 tag。GitHub Actions 做四件事：
+
+| 阶段 | 内容 |
+|---|---|
+| test | 两套测试（插件 69 项 + 服务端 170 项），外加一次不推送的镜像构建 |
+| version | 决定版本号；自动 patch 时把 bump 提交回 `main` 并打 tag |
+| plugin | `npm pack` → GitHub Release（tarball + SHA256 + 无版本号别名） |
+| image | 构建 `linux/amd64` + `linux/arm64` 镜像并推到 GHCR |
+
+### 版本号规则
+
+**patch 位自动递增，minor/major 由人决定。** 规则实现在
+[`scripts/release-version.mjs`](scripts/release-version.mjs)：
+
+| `package.json` 的版本 | 结果 |
+|---|---|
+| 等于最新 tag | 自动 +1（`0.2.3` → `0.2.4`） |
+| 高于最新 tag | **按写的发布**（`0.3.0` 就发 `0.3.0`） |
+| 低于最新 tag | 从 tag 继续 +1，并警告 |
+
+所以升 minor 只需要改**根目录** `package.json` 的版本号然后推送，别的一律不动。
+`claude-server/package.json` 的版本由 workflow 同步写入，不是第二个事实来源——
+只改根目录那一份。
+
+### 手动重跑
+
+- 一次运行失败在 `plugin` 或 `image` 阶段：直接 **Re-run all jobs**。workflow 会在
+  release commit 里写入 `Release-Run: <id>` 标记，重跑据此认出这已经是同一次发布，
+  于是补齐产物而**不会**再发一个新版本。
+- tag 存在但产物丢了：`workflow_dispatch` 填 `version` 显式指定，重新推送产物。
+
+注意 `concurrency: release` 不取消进行中的运行：半推完的发布会留下 tag 与 manifest
+不一致，这比排队慢更糟。
+
+### 本地打包（仅调试用）
+
+`npm pack` 仍是完整的发布构建：它按 `files` 挑文件，自动补上 `README*`、`LICENSE`
+和 `package.json`，并生成 pnpm 需要的 `package/` 前缀。没有构建步骤、没有打包器——
+`lib/` 按源码原样发布。
 
 ```bash
 npm pack                      # → dsh-ccsub-<version>.tgz
@@ -243,20 +298,14 @@ sha256sum dsh-ccsub-<version>.tgz > SHA256SUMS
 ```
 
 `private: true` 只挡 `npm publish`，**不挡** `npm pack`，所以留着这个标记照样能出
-发布产物。建议留着：它是防止误发布的安全阀，而这个包的定位本就是本地使用。
-
-在任意机器上安装该 tarball：
-
-```bash
-# 用 agent 工具：plugin_manager → install_bundle，spec = /绝对路径/<文件名>.tgz
-dsh plugin --profile web add /绝对路径/dsh-ccsub-<version>.tgz
-```
-
-安装后会作为不可变产物进入 profile 的 store（pnpm 指向 `.pnpm/` 的符号链接，而不是
-链回这棵源码树），所以之后在源码目录里的改动不会漏进已安装的发行包。
+发布产物。留着它是防止误发布的安全阀——发布走的是 GitHub Release，不是 npm。
 
 > 交付前先验证：`tar tzf <文件>.tgz | head` 必须只显示一个顶层 `package/` 目录。
 > 没有这层前缀时 pnpm 会把文件摊平到安装根目录，`exports` 里的路径就全部 404。
+> workflow 的 `Pack` 步骤对此显式检查，不依赖人工记忆。
+
+安装后会作为不可变产物进入 profile 的 store（pnpm 指向 `.pnpm/` 的符号链接，而不是
+链回这棵源码树），所以之后在源码目录里的改动不会漏进已安装的发行包。
 
 安装健康的话会打印 `Packages: +1` 并以 0 退出。如果反而报
 `[ERR_PNPM_IGNORED_BUILDS]` 并装了上百个包，说明你装的是 0.2.1 之前的构建——那个
