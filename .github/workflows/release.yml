@@ -231,14 +231,26 @@ jobs:
           file="dsh-ccsub-$version.tgz"
           test -f "$file"
 
+          # The entry list is captured once. Piping `tar tzf` into `head` or
+          # `grep -q` is what broke the first run of this workflow: both stop
+          # reading early, tar dies of SIGPIPE, and `set -o pipefail` turns that
+          # into a failed step — the archive was fine, the check was not.
+          tar tzf "$file" > entries.txt
+          entries=$(wc -l < entries.txt)
+
           # pnpm resolves a tarball's single top-level `package/` prefix. Without
           # it the archive unpacks flat and every `exports` path 404s, so this is
           # checked rather than assumed.
-          top=$(tar tzf "$file" | head -1)
+          top=$(head -1 entries.txt)
           case "$top" in
             package/*) ;;
             *) echo "tarball is missing its package/ prefix (first entry: $top)" >&2; exit 1 ;;
           esac
+
+          # Exactly one top-level directory, so nothing was packed alongside it.
+          tops=$(cut -d/ -f1 entries.txt | sort -u | wc -l)
+          test "$tops" -eq 1 || { echo "tarball has $tops top-level entries, expected 1" >&2; exit 1; }
+          echo "tarball holds $entries entries under package/"
 
           # The packed manifest must name the released version.
           packed=$(tar xzOf "$file" package/package.json \
@@ -247,7 +259,7 @@ jobs:
 
           # Every entry `files` promises has to be inside it.
           for path in lib/index.js lib/client/index.js cordis.patch.yml icon.svg; do
-            tar tzf "$file" | grep -qx "package/$path" || { echo "missing from tarball: $path" >&2; exit 1; }
+            grep -qx "package/$path" entries.txt || { echo "missing from tarball: $path" >&2; exit 1; }
           done
 
           sha256sum "$file" > "$file.sha256"
