@@ -230,6 +230,33 @@ export function createServer(options) {
    */
   const headroomCache = new Map();
   const HEADROOM_TTL_MS = 60_000;
+  /**
+   * When a probe last failed, per account.
+   *
+   * The usage endpoint is rate-limited far more aggressively than messages, and
+   * a 429 there used to leave no trace: the cache stayed empty, so the next
+   * request probed again, and the next, which is how 179 failed probes
+   * accumulated in six hours while not one message request was ever limited.
+   * A failure is now remembered for a growing interval, so a limited probe backs
+   * off instead of hammering.
+   */
+  const probeFailure = new Map();
+  /** Backoff for a failed probe, doubling per consecutive failure up to 15 min. */
+  const PROBE_BACKOFF_BASE_MS = 60_000;
+  const PROBE_BACKOFF_MAX_MS = 15 * 60_000;
+  const inProbeBackoff = (accountId) => {
+    const until = probeFailure.get(accountId)?.until;
+    return until !== undefined && until > Date.now();
+  };
+  const noteProbeFailure = (accountId) => {
+    const entry = probeFailure.get(accountId) ?? { count: 0, until: 0 };
+    entry.count += 1;
+    const delay = Math.min(PROBE_BACKOFF_MAX_MS, PROBE_BACKOFF_BASE_MS * 2 ** (entry.count - 1));
+    entry.until = Date.now() + delay;
+    probeFailure.set(accountId, entry);
+    return delay;
+  };
+  const clearProbeFailure = (accountId) => probeFailure.delete(accountId);
   /** A background usage probe gives up after this long. */
   const HEADROOM_PROBE_TIMEOUT_MS = 5_000;
   /** Account ids known to have run out, with the moment their window resets. */
@@ -258,10 +285,15 @@ export function createServer(options) {
   const refreshHeadroom = async (accountId) => {
     if (closing) return;
     if (headroomOf(accountId) !== undefined) return;
+    if (inProbeBackoff(accountId)) {
+      return;
+    }
     const probe = (async () => {
     try {
       const token = await accessToken(accountId);
-      const target = upstreamFor('/api/oauth/usage', '');
+      // `hosts` is how an embedder redirects this server; omitting it sent
+      // every routing probe to the real API even in tests.
+      const target = upstreamFor('/api/oauth/usage', '', hosts ?? {});
       const headers = withClaudeIdentity(
         { accept: 'application/json', 'anthropic-version': '2023-06-01' },
         config.claudeCliVersion,
@@ -280,11 +312,27 @@ export function createServer(options) {
           headers: Object.fromEntries(headers.entries()),
           signal: controller.signal,
         });
-        if (response.statusCode !== 200) return;
+        if (response.statusCode !== 200) {
+          const delay = noteProbeFailure(accountId);
+          logger.warn(
+            'quota probe for %s answered %d; backing off %ds',
+            accountId,
+            response.statusCode,
+            Math.round(delay / 1000),
+          );
+          // Drain the body so the socket can be reused.
+          try {
+            for await (const _chunk of response.body) void _chunk;
+          } catch {
+            // A body that cannot be read does not change the decision.
+          }
+          return;
+        }
         const chunks = [];
         for await (const chunk of response.body) chunks.push(chunk);
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         headroomCache.set(accountId, { at: Date.now(), value: sessionHeadroom(payload) });
+        clearProbeFailure(accountId);
       } finally {
         clearTimeout(timer);
       }
@@ -687,6 +735,13 @@ export function createServer(options) {
               at: result.at,
             });
           } catch (error) {
+            // Record the failure in the slot. Without this the aggregator retried
+            // a limited account on every poll — a shorter interval than the
+            // 5-minute cache — so a 429 fed itself. The single-account branch
+            // already stored its errors; this one silently dropped them.
+            const slot = quotaSlot(row.id);
+            slot.at = Date.now();
+            slot.error = { error: String(error?.message ?? error), detail: error?.upstreamBody };
             out.push({
               accountId: row.id,
               name: row.name,
