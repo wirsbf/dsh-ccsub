@@ -63,6 +63,60 @@ describe('session fingerprints', () => {
     assert.equal(fingerprintOf({ model: 'x' }), undefined);
     assert.equal(fingerprintOf(null), undefined);
   });
+
+  it('includes the model, because cache entries never cross models', () => {
+    // Two conversations identical in every way except the model share a prefix
+    // but not a cache. Merging them would send opus traffic to the account that
+    // is warm for sonnet, paying a full cache write for the privilege.
+    const sonnet = { ...body(), model: 'claude-sonnet-5-5' };
+    const opus = { ...body(), model: 'claude-opus-5-5' };
+    assert.notEqual(fingerprintOf(sonnet), fingerprintOf(opus));
+  });
+
+  it('stays stable when a later turn appends a fresh timestamp message', () => {
+    // The time-context plugin appends a user message carrying the current
+    // timestamp on every turn. It lands at the END of `messages`, so keying on
+    // messages[0] keeps the fingerprint stable. Keying on the whole array — or
+    // on the last message — would give every turn a new key and defeat the
+    // binding, which is the single most expensive way to get this wrong.
+    const system = [
+      { type: 'text', text: 'You are a coding agent. Browser time zone: Asia/Singapore.' },
+    ];
+    const tools = [{ name: 'bash' }];
+    const opener = { role: 'user', content: [{ type: 'text', text: '修复登录 bug' }] };
+    const turn1 = {
+      model: 'claude-sonnet-5-5',
+      system,
+      tools,
+      messages: [
+        opener,
+        { role: 'user', content: [{ type: 'text', text: 'Turn 1 step 1: 2026-10-24T20:33:09+08:00' }] },
+      ],
+    };
+    const turn3 = {
+      model: 'claude-sonnet-5-5',
+      system,
+      tools,
+      messages: [
+        opener,
+        { role: 'user', content: [{ type: 'text', text: 'Turn 1 step 1: 2026-10-24T20:33:09+08:00' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+        { role: 'user', content: [{ type: 'text', text: 'Turn 3 step 1: 2026-10-24T20:41:52+08:00' }] },
+      ],
+    };
+    assert.equal(fingerprintOf(turn3), fingerprintOf(turn1));
+  });
+
+  it('treats identical prefixes as one conversation, deliberately', () => {
+    // Two conversations that agree on model, system, tools and opening message
+    // share a prefix, so they share a cache on any one account. Binding them to
+    // the same account preserves exactly what the binding exists to preserve;
+    // calling this a collision would be a misreading of the cache, not a bug.
+    const a = body('same opening');
+    const b = body('same opening');
+    b.max_tokens = 8192;
+    assert.equal(fingerprintOf(b), fingerprintOf(a));
+  });
 });
 
 describe('session bindings', () => {

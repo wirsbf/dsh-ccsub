@@ -61,7 +61,9 @@ export function fingerprintOf(body) {
 
   // JSON.stringify is order-stable for the objects Anthropic bodies contain,
   // and the client rebuilds these fields identically each turn.
-  const material = JSON.stringify([system ?? null, tools ?? null, first ?? null]);
+  // Model first: it is the cheapest discriminator and the one that decides
+  // whether a cache entry can be reused at all.
+  const material = JSON.stringify([body.model ?? null, system ?? null, tools ?? null, first ?? null]);
   return createHash('sha256').update(material).digest('hex').slice(0, 32);
 }
 
