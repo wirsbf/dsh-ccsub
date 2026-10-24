@@ -342,11 +342,25 @@ test('apply registers one section and both dictionaries', async () => {
   assert.equal(dictionaries.get('zh').title, 'Claude 订阅');
 });
 
-test('the card renders its copy', async () => {
-  const { components, t } = await boot();
-  const text = textOf(components[0]({ t })).join(' ');
-  assert.match(text, /Claude Subscription/);
-  assert.match(text, /Where the subscription lives/);
+test('the card renders its copy', async (t) => {
+  // The signed-out card is the sign-in form now, and the form is only what a
+  // real status produces: before the first fetch resolves the card renders its
+  // loading state, so this settles a live render rather than a static one.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody({
+      mode: 'claude-server',
+      grant: { configured: false },
+      claudeServer: { url: '', valid: false, bearerConfigured: false },
+      proxy: { active: false, valid: false, url: '', allow: [], requireEgressCheck: true },
+    }),
+    [`${API}/quota`]: { windows: [] },
+  });
+  const { text } = await settle(components[0], { t: copy });
+  assert.match(text, /Sign in to Claude/);
+  assert.match(text, /Server address/);
 });
 
 test('opening the route settings disclosure renders the panel', async () => {
@@ -413,8 +427,12 @@ test('the card is one bordered card whose sections are not nested boxes', async 
 
   assert.equal(byClass(elements, 'ccsub-card').length, 1, 'exactly one card element');
 
+  // Two content sections signed in: quota and egress. The state moved to the
+  // one-line strip and transport moved into the sign-in form, so a third
+  // section would mean one of them crept back as a panel.
   const sections = byClass(elements, 'ccsub-section');
-  assert.ok(sections.length >= 3, 'the card renders several sections');
+  assert.ok(sections.length >= 2, 'the card renders its content sections');
+  assert.equal(byClass(elements, 'ccsub-strip').length, 1, 'the state is one strip, not a section');
 
   // The old design nested a bordered `.ccsub-section` inside another bordered
   // box. Sections are now flat children of the single card, so no section may
@@ -427,72 +445,87 @@ test('the card is one bordered card whose sections are not nested boxes', async 
   }
 });
 
-test('the status header leads the card and names the sign-in state', async (t) => {
+test('the state strip leads the card and collapses the state to one row', async (t) => {
+  // Signed in, the state is a single line rather than the old tall panel: the
+  // dot, the label, the backing fact, and the sign-out action share a row.
   const runtime = liveReact();
   const { components, t: copy } = await boot(runtime.React);
   const { settle } = runtime;
   stubFetch(t, { [`${API}/status`]: statusBody(), [`${API}/quota`]: { windows: [] } });
   const { text, elements } = await settle(components[0], { t: copy });
 
-  // The strongest label is the sign-in state as text, not a badge.
-  const labels = byClass(elements, 'ccsub-status-label');
-  assert.equal(labels.length, 1, 'one status label');
+  const strips = byClass(elements, 'ccsub-strip');
+  assert.equal(strips.length, 1, 'exactly one state strip');
+
+  const labels = byClass(elements, 'ccsub-strip-label');
+  assert.equal(labels.length, 1, 'one state label');
   assert.match(text, /Signed in/);
 
-  // The state dot is decorative: the state is carried by the text beside it.
+  // The dot is decorative: the state is carried by the text beside it.
   const dots = byClass(elements, 'ccsub-dot');
   assert.equal(dots.length, 1, 'one state dot');
   assert.equal(dots[0].props['aria-hidden'], 'true');
 
-  // The secondary fact (token expiry) sits beside the label.
-  assert.equal(byClass(elements, 'ccsub-status-fact').length, 1);
-  assert.match(text, /expires/);
-
-  // The status block is the first section in document order.
-  const sections = byClass(elements, 'ccsub-section');
-  assert.ok(
-    sections[0].props.className.split(/\s+/).includes('ccsub-status'),
-    'the status section renders first',
-  );
+  // The strip precedes every content section, so the state is read first.
+  const stripAt = elements.indexOf(strips[0]);
+  const quotaAt = elements.indexOf(byClass(elements, 'ccsub-section')[0]);
+  assert.ok(stripAt < quotaAt, 'the state strip renders before the sections');
 });
 
-test('a signed-out card says so and offers a sign-in button', async (t) => {
-  const runtime = liveReact();
-  const { components, t: copy } = await boot(runtime.React);
-  const { settle } = runtime;
-  stubFetch(t, {
-    [`${API}/status`]: statusBody({ grant: { configured: false } }),
-    [`${API}/quota`]: { windows: [] },
-  });
-  const { text, elements } = await settle(components[0], { t: copy });
-
-  assert.match(text, /Not signed in/);
-  const dots = byClass(elements, 'ccsub-dot');
-  assert.equal(dots.length, 1);
-  assert.equal(dots[0].props.className.includes('ok'), false, 'a signed-out dot is not the success state');
-
-  const primary = byClass(elements, 'ccsub-btn').filter((button) =>
-    String(button.props.className).includes('primary'),
-  );
-  assert.ok(primary.length >= 1, 'sign-in is the primary action');
-  assert.match(text, /Sign in with browser/);
-});
-
-test('in claude-server mode the status fact names the backend address', async (t) => {
+test('a signed-out card is a sign-in form, not a dashboard', async (t) => {
+  // The whole point of the redesign: signed out, there is exactly one thing to
+  // do, and no quota/egress panel reports on a route that cannot send.
   const runtime = liveReact();
   const { components, t: copy } = await boot(runtime.React);
   const { settle } = runtime;
   stubFetch(t, {
     [`${API}/status`]: statusBody({
       mode: 'claude-server',
-      claudeServer: { url: 'http://10.0.0.12:4710', bearerConfigured: true, bearerRecord: 'claude-server' },
+      grant: { configured: false },
+      claudeServer: { url: '', valid: false, bearerConfigured: false },
+      proxy: { active: false, valid: false, url: '', allow: [], requireEgressCheck: true },
+    }),
+    [`${API}/quota`]: { windows: [] },
+  });
+  const { text, elements } = await settle(components[0], { t: copy });
+
+  assert.equal(byClass(elements, 'ccsub-signin').length, 1, 'the sign-in form renders');
+  assert.equal(byClass(elements, 'ccsub-strip').length, 0, 'no state strip while signed out');
+
+  // The form asks for the two things a claude-server connect needs.
+  const inputs = byClass(elements, 'ccsub-input');
+  assert.ok(inputs.length >= 2, 'address and token inputs are on the form');
+  assert.match(text, /Server address/);
+  assert.match(text, /Access token/);
+
+  // Connect is the primary action, and the panel sections are absent.
+  const primary = byClass(elements, 'ccsub-btn').filter((b) =>
+    String(b.props.className).includes('primary'),
+  );
+  assert.ok(primary.length >= 1, 'connect is the primary action');
+  assert.match(text, /Connect/);
+  assert.equal(byClass(elements, 'ccsub-meter').length, 0, 'no quota meters before sign-in');
+});
+
+test('in claude-server mode the strip names the backend address', async (t) => {
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody({
+      mode: 'claude-server',
+      grant: { configured: false },
+      claudeServer: { url: 'http://10.0.0.12:4710', valid: true, bearerConfigured: true, bearerRecord: 'claude-server' },
     }),
     [`${API}/quota`]: { windows: [] },
   });
   const { text, elements } = await settle(components[0], { t: copy });
 
   assert.match(text, /10\.0\.0\.12:4710/);
-  assert.equal(byClass(elements, 'ccsub-status-fact').length, 1);
+  assert.equal(byClass(elements, 'ccsub-strip-fact').length, 1);
+
+  // Disconnect, not sign-out: this route never held the grant.
+  assert.match(text, /Disconnect/);
 });
 
 test('a working claude-server route does not report itself as signed out', async (t) => {
@@ -515,7 +548,7 @@ test('a working claude-server route does not report itself as signed out', async
   const { text, elements } = await settle(components[0], { t: copy });
 
   assert.doesNotMatch(text, /Not signed in/, 'a working backend is not a signed-out state');
-  const labels = byClass(elements, 'ccsub-status-label');
+  const labels = byClass(elements, 'ccsub-strip-label');
   assert.equal(labels.length, 1);
   assert.match(String(labels[0].children ?? ''), /Connected/);
 
@@ -528,7 +561,7 @@ test('a working claude-server route does not report itself as signed out', async
   assert.doesNotMatch(text, /Sign in with browser/);
 });
 
-test('in claude-server mode an unconfigured backend is reported and offers no sign-in', async (t) => {
+test('in claude-server mode an unconfigured backend is reported as a sign-in form', async (t) => {
   const runtime = liveReact();
   const { components, t: copy } = await boot(runtime.React);
   const { settle } = runtime;
@@ -544,8 +577,8 @@ test('in claude-server mode an unconfigured backend is reported and offers no si
   const { text } = await settle(components[0], { t: copy });
 
   assert.doesNotMatch(text, /Not signed in/, 'the misleading label does not come back');
-  assert.match(text, /No backend configured/);
-  assert.doesNotMatch(text, /Sign in with browser/);
+  assert.match(text, /Sign in to Claude/, 'the sign-in form is what an unconfigured backend shows');
+  assert.doesNotMatch(text, /Sign in with browser/, 'claude-server never offers the browser flow');
 });
 
 test('meters render each window with its percentage as text and a hidden bar', async (t) => {
