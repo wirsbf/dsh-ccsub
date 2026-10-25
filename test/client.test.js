@@ -284,7 +284,14 @@ function stubFetch(t, responses) {
   const seen = [];
   globalThis.fetch = async (url) => {
     seen.push(String(url));
-    return { ok: true, status: 200, json: async () => responses[String(url)] ?? {} };
+    const entry = responses[String(url)] ?? {};
+    // A plain body keeps every existing call site working. Wrapping it in
+    // `{ status, body }` is how a test asks for a failure, which the card must
+    // distinguish from a successful read that happens to be empty.
+    const shaped = entry !== null && typeof entry === 'object' && 'status' in entry && 'body' in entry;
+    const status = shaped ? entry.status : 200;
+    const body = shaped ? entry.body : entry;
+    return { ok: status >= 200 && status < 300, status, json: async () => body };
   };
   t.after(() => {
     globalThis.fetch = original;
@@ -629,6 +636,109 @@ test('meters render each window with its percentage as text and a hidden bar', a
   assert.ok(classes[2].includes('critical'), '96% is critical');
 
   assert.match(text, /Reset time unknown/);
+});
+
+test('a failed quota read with no figures yet is the whole story', async (t) => {
+  // Cold start, nothing known: the error *is* the state, so it takes the slot.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody(),
+    [`${API}/quota`]: { status: 502, body: { error: 'rate limited', code: 'USAGE_FAILED' } },
+  });
+  const { text, elements } = await settle(components[0], { t: copy });
+
+  assert.match(text, /Could not read usage/, 'the failure is reported');
+  assert.match(text, /rate limited/, 'with the reason the host gave');
+  assert.equal(byClass(elements, 'ccsub-meter').length, 0, 'there is nothing to meter');
+});
+
+test('a figure once known survives a failed refresh, and the error becomes a note', async (t) => {
+  // The flash this fixes: a mount whose first quota read fails while a previous
+  // reading is still perfectly good used to replace the meters with a red line,
+  // then put them back on the next poll. Numbers that are known stay on screen;
+  // the failure is reported beside them as a stale marker, not as the content.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle, instances } = runtime;
+
+  let quotaCalls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.endsWith('/quota')) {
+      quotaCalls += 1;
+      // First read succeeds, every later read fails — the sticky 429 shape.
+      if (quotaCalls === 1) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ windows: [{ kind: 'session', usedPercent: 12 }], fetchedAt: Date.now() }),
+        };
+      }
+      return { ok: false, status: 502, json: async () => ({ error: 'rate limited', code: 'USAGE_FAILED' }) };
+    }
+    return { ok: true, status: 200, json: async () => statusBody() };
+  };
+  t.after(() => {
+    globalThis.fetch = original;
+  });
+
+  const first = await settle(components[0], { t: copy });
+  assert.equal(byClass(first.elements, 'ccsub-meter').length, 1, 'the first read renders its meter');
+  assert.doesNotMatch(first.text, /Could not read usage/);
+
+  // Trigger another refresh the way the operator would: the button.
+  const refresh = byClass(first.elements, 'ccsub-btn').find(
+    (button) => button.props.onClick !== undefined && /Refresh/.test(String(button.children ?? '')),
+  );
+  assert.ok(refresh !== undefined, 'the refresh control is present');
+  refresh.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const second = await settle(components[0], { t: copy });
+
+  // The meter is still there — this is the assertion the old code failed.
+  assert.equal(byClass(second.elements, 'ccsub-meter').length, 1, 'the known figure is not replaced by an error');
+  assert.match(second.text, /12% used/, 'the reading is still shown');
+  // And the failure is still reported, quietly.
+  assert.match(second.text, /Showing the last reading/, 'the stale note explains the figures');
+  assert.match(second.text, /rate limited/);
+  // It must not be an alert: it is not a new state, and re-announcing it every
+  // poll would be noise.
+  const stale = byClass(second.elements, 'ccsub-stale');
+  assert.equal(stale.length, 1, 'one stale note');
+  assert.equal(stale[0].props.role, undefined, 'the stale note is not an alert');
+});
+
+test('a stale error alongside known figures is not treated as a cold failure', async (t) => {
+  // The host now answers 200 with `staleError` when it still holds windows, so
+  // the card must render the figures rather than the 502-shaped error. This
+  // pins the contract between the two sides: if the host stopped sending the
+  // windows, this body is what a card would see.
+  const runtime = liveReact();
+  const { components, t: copy } = await boot(runtime.React);
+  const { settle } = runtime;
+  stubFetch(t, {
+    [`${API}/status`]: statusBody(),
+    [`${API}/quota`]: {
+      status: 200,
+      body: {
+        supported: true,
+        windows: [{ kind: 'session', usedPercent: 34 }],
+        fetchedAt: Date.now(),
+        staleError: 'rate limited',
+      },
+    },
+  });
+  const { text, elements } = await settle(components[0], { t: copy });
+
+  assert.equal(byClass(elements, 'ccsub-meter').length, 1, 'the window is rendered');
+  assert.match(text, /34% used/);
+  // The host's 200-with-staleError path must produce the same note as a local
+  // failure, or the two sides can drift apart without any test noticing.
+  assert.match(text, /Showing the last reading/, 'the stale marker reaches the card');
+  assert.match(text, /rate limited/, 'with the reason');
 });
 
 test('the route-settings disclosure reports its state and opens the panel', async (t) => {
