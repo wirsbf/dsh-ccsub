@@ -970,7 +970,9 @@ export const CONSOLE_SCRIPT = `
    *
    * The reused-with-write case is the only outcome that means a cached prefix
    * was paid for again; the rest are normal and are labelled so they are not
-   * mistaken for failures.
+   * mistaken for failures. Expiry deserves its own word rather than being
+   * folded in with a rewrite, because it is the difference between a bug in the
+   * client and the cache simply ageing out while nobody was typing.
    */
   var verdictLabel = function (verdict) {
     var span = document.createElement('span');
@@ -979,6 +981,7 @@ export const CONSOLE_SCRIPT = `
       extended: ['grew', 'The prompt grew past this prefix high-water mark, so writing the new tail is expected. The part up to the old mark should still have been a read.'],
       reused: ['reused', 'The prompt did not grow, so the whole prefix should have come from cache. A cache write here is the expensive case: it was already paid for.'],
       rewritten: ['rewritten', 'The prompt grew only slightly but the cache write covers the whole prefix instead of just the new tail. The prefix was rebuilt rather than extended, which costs what never having cached would have.'],
+      expired: ['expired', 'This conversation was idle for longer than the cache survives (one hour), so the cached prefix was gone upstream and rewriting it was unavoidable. Not waste: nothing could have been reused.'],
       unknown: ['—', 'No cache identity was recorded for this request.']
     };
     var kind = kinds[verdict] || kinds.unknown;

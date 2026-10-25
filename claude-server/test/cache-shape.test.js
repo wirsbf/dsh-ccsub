@@ -155,13 +155,25 @@ describe('UsageLedger cache verdicts', () => {
     assert.equal(ledger.byCacheIdentity.get('a:b').wastedWrites, 0);
   });
 
-  it('treats a prompt just past the mark as growth, not reuse', () => {
-    // Block granularity means the prompt edges past the cached size on almost
-    // every real turn; that turn is an extension, and calling it a miss would
-    // make every healthy conversation look broken.
+  it('counts a full read as reuse even though input tokens are uncached', () => {
+    // Input tokens sit past the last breakpoint and are never cached, so a
+    // prompt of `15000 read + 4 input` is a complete hit on a 15000 prefix, not
+    // a prompt that outgrew it. Comparing the whole prompt against the mark made
+    // this look like growth on every single turn.
     const ledger = new UsageLedger();
     call(ledger, 'a:b', { input: 8, write: 15000 });
     const row = call(ledger, 'a:b', { input: 4, read: 15000 });
+    assert.equal(row.cacheVerdict, 'reused');
+    assert.equal(ledger.byCacheIdentity.get('a:b').wastedWrites, 0);
+  });
+
+  it('treats a write of the new tail as growth, not a miss', () => {
+    // Block granularity means a real turn grows the prompt by a little and
+    // writes that little: a read of the old prefix plus a small write. Calling
+    // this a miss would make every healthy conversation look broken.
+    const ledger = new UsageLedger();
+    call(ledger, 'a:b', { input: 8, write: 15000 });
+    const row = call(ledger, 'a:b', { input: 4, read: 15000, write: 600 });
     assert.equal(row.cacheVerdict, 'extended');
     assert.equal(ledger.byCacheIdentity.get('a:b').wastedWrites, 0);
   });
@@ -276,5 +288,72 @@ describe('cache verdicts are per conversation, not per prompt shape', () => {
     call(ledger, 'id', undefined, { input: 8, write: 50_000 });
     const second = call(ledger, 'id', undefined, { input: 8, read: 2_000, write: 50_000 });
     assert.equal(second.cacheVerdict, 'first');
+  });
+});
+
+describe('an aged-out cache is not reported as a rebuilt prefix', () => {
+  /**
+   * Record one call at an explicit moment, so a gap can be created without
+   * waiting for one.
+   */
+  function callAt(ledger, at, { input = 0, read = 0, write = 0, session = 'one' }) {
+    ledger.record({
+      input_tokens: input,
+      output_tokens: 5,
+      cache_read_input_tokens: read,
+      cache_creation_input_tokens: write,
+      cacheIdentity: 'id:abc',
+      sessionKey: session,
+      shape: { toolsCount: 0, systemBytes: 100, messagesCount: 2 },
+      at,
+    });
+    return ledger.recent[0];
+  }
+
+  // The observed production shape: a conversation resumed every three hours, so
+  // every call is the first of a burst, reads nothing, and writes the whole
+  // prompt. The one-hour cache cannot survive that gap.
+  it('calls a write after the retention window expired, not a rewrite', () => {
+    const ledger = new UsageLedger();
+    const base = Date.UTC(2026, 9, 25, 0, 0, 0);
+    callAt(ledger, base, { input: 8, write: 85_000 });
+    const later = callAt(ledger, base + 3 * 60 * 60 * 1000, { input: 8, write: 85_000 });
+    assert.equal(later.cacheVerdict, 'expired');
+    assert.equal(later.idleMs, 3 * 60 * 60 * 1000);
+    assert.equal(ledger.byCacheIdentity.get('id:abc').wastedWrites, 0, 'an unavoidable write is not waste');
+    assert.equal(ledger.byCacheIdentity.get('id:abc').expired, 1);
+  });
+
+  it('reports the same write inside the window as the real anomaly', () => {
+    // Expiry must not become a blanket excuse. Ten minutes apart with the same
+    // full rewrite is exactly the bug this instrumentation is for.
+    const ledger = new UsageLedger();
+    const base = Date.UTC(2026, 9, 25, 0, 0, 0);
+    callAt(ledger, base, { input: 8, write: 85_000 });
+    const soon = callAt(ledger, base + 10 * 60 * 1000, { input: 8, read: 0, write: 85_000 });
+    assert.equal(soon.cacheVerdict, 'reused', 'the prompt fits the known prefix, so it should have been read');
+    assert.equal(ledger.byCacheIdentity.get('id:abc').wastedWrites, 1);
+  });
+
+  it('does not excuse a call that only just exceeds the window', () => {
+    // A minute of margin is allowed for clock skew at the boundary; an hour and
+    // a minute of idle is past the longest retention Anthropic offers.
+    const ledger = new UsageLedger();
+    const base = Date.UTC(2026, 9, 25, 0, 0, 0);
+    callAt(ledger, base, { input: 8, write: 10_000 });
+    const inside = callAt(ledger, base + 59 * 60 * 1000, { input: 8, write: 10_000 });
+    assert.equal(inside.cacheVerdict, 'reused');
+  });
+
+  it('forgets per-conversation history on reset', () => {
+    // A reset that leaves the high-water marks behind keeps judging the new
+    // window by the old one, which is a stale answer to a new question.
+    const ledger = new UsageLedger();
+    const base = Date.UTC(2026, 9, 25, 0, 0, 0);
+    callAt(ledger, base, { input: 8, write: 50_000 });
+    ledger.reset();
+    const after = callAt(ledger, base + 1000, { input: 8, write: 50_000 });
+    assert.equal(after.cacheVerdict, 'first');
+    assert.equal(ledger.bySession.size, 1);
   });
 });

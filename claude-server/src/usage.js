@@ -44,6 +44,28 @@ const MAX_RECENT = 50;
  */
 const WASTE_MARGIN = 1024;
 
+/**
+ * How long a cached prefix survives unused, in milliseconds.
+ *
+ * Anthropic's longest retention is one hour, and this deployment asks for it
+ * (`cacheRetention: 'long'`). Past that the prefix is gone from the cache, so
+ * the next call in the conversation must write the whole prompt again however
+ * carefully the client kept its prefix stable. That write is not waste and must
+ * not be labelled as such: calling it a rebuilt prefix sent this investigation
+ * after the wrong subsystem once already.
+ */
+const CACHE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Slack subtracted from {@link CACHE_TTL_MS} before a prefix is called expired.
+ *
+ * The limit is enforced upstream, so a call arriving just under the hour mark
+ * can still miss. Erring towards "already expired" trades a missed real rewrite
+ * that happens to follow a long gap for not crying wolf about an unavoidable
+ * write, which is the right trade for an alarm.
+ */
+const TTL_MARGIN_MS = 60 * 1000;
+
 /** Default bound on a pending SSE frame, in characters. */
 const DEFAULT_FRAME_LIMIT = 256 * 1024;
 
@@ -286,13 +308,21 @@ export class UsageLedger {
    *   read. Any write at all here is the costly case: the prefix was already
    *   cached and was paid for again.
    *
+   * A fourth case sits alongside them and must not be folded into any of them:
+   *
+   * - `expired` — the previous call in this conversation was longer ago than the
+   *   cache survives, so whatever was cached is gone upstream. The write is
+   *   unavoidable and is reported as such rather than as waste.
+   *
    * @param identity - the (tools, system) cache identity, or undefined.
+   * @param sessionKey - the conversation fingerprint, or undefined.
    * @param promptTokens - this call's total prompt size (input + cache read + cache write).
    * @param readTokens - of that, how much came from cache.
    * @param writeTokens - of that, how much was written to cache.
-   * @returns {{verdict: string, identity?: string, previousHigh?: number, reuseRatio?: number}}
+   * @param now - this call's arrival time in epoch milliseconds, for the gap.
+   * @returns {{verdict: string, identity?: string, previousHigh?: number, reuseRatio?: number, idleMs?: number}}
    */
-  classifyCache(identity, sessionKey, promptTokens, readTokens, writeTokens) {
+  classifyCache(identity, sessionKey, promptTokens, readTokens, writeTokens, now = Date.now()) {
     if (identity === undefined) return { verdict: 'unknown' };
     const bucket = this.byCacheIdentity.get(identity) ?? {
       calls: 0,
@@ -300,6 +330,7 @@ export class UsageLedger {
       extended: 0,
       reused: 0,
       rewritten: 0,
+      expired: 0,
       wastedWrites: 0,
       highWater: 0,
     };
@@ -311,10 +342,24 @@ export class UsageLedger {
     // something was cached, which is why `first` reports none.
     const reuseRatio = promptTokens > 0 ? readTokens / promptTokens : undefined;
 
+    // How long this conversation went quiet beforehand. Nothing else in this
+    // analysis can distinguish "the client rebuilt its prefix" from "the cache
+    // simply aged out", and the two call for opposite responses, so the gap is
+    // measured rather than assumed.
+    const idleMs = session?.lastSeen === undefined ? undefined : now - session.lastSeen;
+    const expired = idleMs !== undefined && idleMs > CACHE_TTL_MS - TTL_MARGIN_MS;
+
     // How much *new* content this call brought, relative to the largest prefix
-    // this identity has already cached. Everything up to `previousHigh` was
+    // this conversation has already cached. Everything up to `previousHigh` was
     // already cacheable and should have been read.
-    const growth = Math.max(0, promptTokens - previousHigh);
+    //
+    // Measured as read+write, not as the whole prompt: input tokens sit past the
+    // last cache breakpoint and are never cached, so including them made every
+    // call look one input-length larger than the mark and pushed ordinary cache
+    // reads out of `reused` and into `extended`. The two sides of this
+    // comparison must count the same thing.
+    const cacheable = readTokens + writeTokens;
+    const growth = Math.max(0, cacheable - previousHigh);
     // A write is expected to cover the growth and little else. Anthropic caches
     // in blocks, so a write a couple of blocks larger than the growth is normal;
     // one that dwarfs it means the prefix was rebuilt instead of extended, which
@@ -323,7 +368,11 @@ export class UsageLedger {
 
     let verdict;
     if (session === undefined) verdict = 'first';
-    else if (promptTokens <= previousHigh) verdict = 'reused';
+    // Expiry is decided before reuse: a prompt that fits inside the remembered
+    // high-water mark but arrives after the cache aged out was never going to be
+    // read, so calling that `reused` would invent a miss.
+    else if (expired) verdict = 'expired';
+    else if (cacheable <= previousHigh) verdict = 'reused';
     else verdict = wasted ? 'rewritten' : 'extended';
 
     // What the cache holds after this call: everything read back plus everything
@@ -339,17 +388,18 @@ export class UsageLedger {
     // pure aggregate: `highWater` there is the largest single session's, which
     // is what "how big does this prefix get" asks.
     if (sessionKey !== undefined) {
-      this.bySession.set(sessionKey, { highWater: nextHigh });
+      this.bySession.set(sessionKey, { highWater: nextHigh, lastSeen: now });
     }
     bucket.calls += 1;
     bucket[verdict] += 1;
     // The number that matters: a write that bought little or no new prefix.
+    // `expired` is deliberately excluded — the prefix was not there to reuse.
     if ((verdict === 'reused' || verdict === 'rewritten') && writeTokens > 0) bucket.wastedWrites += 1;
     bucket.highWater = Math.max(bucket.highWater, nextHigh);
     bucket.sessions = this.bySession.size;
     this.byCacheIdentity.set(identity, bucket);
 
-    return { verdict, identity, previousHigh, reuseRatio };
+    return { verdict, identity, previousHigh, reuseRatio, idleMs };
   }
 
   /**
@@ -412,16 +462,22 @@ export class UsageLedger {
     const readTokens = entry.cache_read_input_tokens ?? 0;
     const writeTokens = entry.cache_creation_input_tokens ?? 0;
     const promptTokens = inputTokens + readTokens + writeTokens;
+    // One clock reading for the row and for the gap it is judged by, so the two
+    // cannot disagree about when this call happened. An explicit `at` is honoured
+    // so a caller — a test, or a replay of recorded traffic — can place a call at
+    // the moment it really happened instead of when it was re-read.
+    const now = typeof entry.at === 'number' ? entry.at : Date.now();
     const cache = this.classifyCache(
       identity,
       entry.sessionKey,
       promptTokens,
       readTokens,
       writeTokens,
+      now,
     );
 
     this.recent.unshift({
-      at: Date.now(),
+      at: now,
       model: model ?? null,
       input_tokens: inputTokens,
       output_tokens: entry.output_tokens ?? 0,
@@ -434,6 +490,9 @@ export class UsageLedger {
       cacheIdentity: identity ?? null,
       cacheVerdict: cache.verdict,
       reuseRatio: cache.reuseRatio ?? null,
+      // How long this conversation was quiet beforehand, so a reader can tell an
+      // expired prefix from a rebuilt one without doing arithmetic on timestamps.
+      idleMs: cache.idleMs ?? null,
       shape: shape ?? null,
     });
     if (this.recent.length > MAX_RECENT) this.recent.length = MAX_RECENT;
@@ -491,6 +550,10 @@ export class UsageLedger {
     this.byUser.clear();
     this.byAccount.clear();
     this.byCacheIdentity.clear();
+    // Per-conversation history is state too. Leaving it behind made a reset keep
+    // judging new calls against high-water marks and idle gaps from before it,
+    // which is a stale answer to a question about the current window.
+    this.bySession.clear();
     this.recent = [];
     this.since = Date.now();
     this.costUsd = 0;
