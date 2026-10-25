@@ -1,6 +1,6 @@
 {
   "name": "dsh-ccsub-claude-server",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "private": true,
   "type": "module",
   "description": "Holds the Claude Pro/Max grant for dsh-ccsub and re-emits the Claude Code request identity. Local DSH clients authenticate with a bearer and never see the real token.",
