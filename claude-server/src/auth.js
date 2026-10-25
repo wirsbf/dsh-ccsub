@@ -36,7 +36,7 @@
  */
 
 import { timingSafeEqual } from 'node:crypto';
-import { LEGACY_USER_ID, LEGACY_USER_NAME } from './users.js';
+import { AUTO_ACCOUNT, LEGACY_USER_ID, LEGACY_USER_NAME } from './users.js';
 
 /** The scheme the client must use. */
 const SCHEME = 'bearer';
@@ -108,9 +108,23 @@ export class ClientAuth {
       name: LEGACY_USER_NAME,
       role: 'admin',
       legacy: true,
-      // The bootstrap bearer predates accounts, so it spends the default
-      // account — the same one every pre-accounts token resolves to.
-      accountId: null,
+      // The bootstrap bearer follows the account pool rather than pinning the
+      // default account.
+      //
+      // It used to carry `accountId: null`, on the reading that "a token minted
+      // before accounts existed must keep spending the account that was the only
+      // one at the time". That is true for *migrating* a pre-accounts token, but
+      // this bearer is not a migrated token: it is the deployment's own
+      // bootstrap credential, and `.env` is where it is configured today. Pinning
+      // it meant the single credential an unconfigured deployment actually uses
+      // never took part in routing — every request went to the default account
+      // even with several signed in, so a default account at 91% parked the whole
+      // relay while a second account sat at 0%, and no console setting could fix
+      // it: the token is not in `users.json`, so the per-user `accountId` field
+      // never applied to it. `AUTO_ACCOUNT` makes it behave like any other
+      // routing token, including the per-conversation binding that keeps a live
+      // conversation on one subscription so its prompt cache survives.
+      accountId: AUTO_ACCOUNT,
     };
   }
 

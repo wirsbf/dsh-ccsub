@@ -16,8 +16,10 @@ import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import { AccountDirectory, rankForNewSession, sessionHeadroom } from '../src/accounts.js';
+import { ClientAuth } from '../src/auth.js';
 import { CACHE_READ_MULTIPLIER, CACHE_WRITE_MULTIPLIER, costOf, formatUsd, priceFor } from '../src/pricing.js';
 import { SessionBindings, fingerprintOf } from '../src/sessions.js';
+import { AUTO_ACCOUNT } from '../src/users.js';
 
 const quietLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
@@ -379,5 +381,34 @@ describe('account quota limits', () => {
     } finally {
       await made.close();
     }
+  });
+});
+
+describe('the bootstrap bearer joins the pool', () => {
+  const BEARER = 'a'.repeat(40);
+
+  /** A ClientAuth with no user directory, so every request resolves to the bootstrap bearer. */
+  const auth = () => new ClientAuth(BEARER);
+
+  it('is an auto token rather than a pin to the default account', async () => {
+    // Pinning meant the one credential a bare deployment actually uses never
+    // took part in routing: with a second subscription signed in, every request
+    // still went to the default account, so a default at 91% parked the relay
+    // while the other sat at 0%. `users.json` cannot fix that either, because
+    // this bearer is not one of its rows.
+    const identity = await auth().checkUser(`Bearer ${BEARER}`);
+    assert.equal(identity.accountId, AUTO_ACCOUNT);
+  });
+
+  it('still authenticates as an admin', async () => {
+    const identity = await auth().checkAdmin(`Bearer ${BEARER}`);
+    assert.equal(identity.role, 'admin');
+    assert.equal(identity.accountId, AUTO_ACCOUNT);
+  });
+
+  it('is not offered a known account by routing when nothing is signed in', () => {
+    // Ranking must not invent a choice: with no usable row the relay falls back
+    // to the default account, which is what serving `null` does.
+    assert.deepEqual(rankForNewSession([], () => undefined), []);
   });
 });

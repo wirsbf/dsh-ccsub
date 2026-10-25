@@ -153,8 +153,12 @@ test('relay replaces the client bearer with the real token and the real identity
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     });
     assert.equal(response.status, 200);
-    assert.equal(upstream.seen.length, 1);
-    const wire = upstream.seen[0];
+    // The bootstrap bearer is an `auto` token, so the first relay picks an
+    // account and kicks off a background headroom probe against the upstream.
+    // Only the messages call is the relayed request under test.
+    const relayed = upstream.seen.filter((record) => record.url.startsWith('/v1/messages'));
+    assert.equal(relayed.length, 1);
+    const wire = relayed[0];
 
     // The upstream must never see the client's bearer.
     assert.equal(wire.headers.authorization, `Bearer ${REAL_TOKEN}`);
@@ -189,7 +193,9 @@ test('relay sanitises the system array and leaves messages alone', async () => {
       system: [{ type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' }],
       messages: [{ role: 'user', content: [{ type: 'text', text: 'DeepSeek Harness 是什么' }] }],
     });
-    const body = JSON.parse(upstream.seen[0].body);
+    // Skip the background headroom probe the auto token triggers; the messages
+    // call is the one whose body this test is about.
+    const body = JSON.parse(upstream.seen.find((record) => record.url.startsWith('/v1/messages')).body);
     assert.equal(body.system[0].text, 'You are a coding agent.');
     assert.equal(body.messages[0].content[0].text, 'DeepSeek Harness 是什么');
   } finally {
